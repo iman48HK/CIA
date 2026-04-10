@@ -3,6 +3,8 @@ export interface Me {
   email: string
   role: 'admin' | 'user'
   is_active: boolean
+  display_name?: string | null
+  avatar_url?: string | null
 }
 
 export function useAuth() {

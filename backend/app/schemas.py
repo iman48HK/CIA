@@ -25,6 +25,8 @@ class UserOut(BaseModel):
     role: UserRoleEnum
     is_active: bool
     created_at: datetime
+    display_name: str | None = None
+    avatar_url: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -32,6 +34,14 @@ class UserOut(BaseModel):
 class UserAdminUpdate(BaseModel):
     role: UserRoleEnum | None = None
     is_active: bool | None = None
+
+
+class UserProfileUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=255)
+    email: EmailStr | None = None
+    avatar_url: str | None = None
+    current_password: str | None = None
+    new_password: str | None = Field(default=None, min_length=6)
 
 
 class ProjectCreate(BaseModel):

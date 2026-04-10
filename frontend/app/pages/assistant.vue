@@ -1,5 +1,6 @@
 <script setup lang="ts">
 definePageMeta({ middleware: 'auth' })
+import { marked } from 'marked'
 
 const { apiFetch, base, token } = useApi()
 const message = ref('')
@@ -166,7 +167,7 @@ async function generateStandardReport() {
   if (!selectedProjectId.value) return
   reportResult.value = await apiFetch<ReportResult>('/ai/reports/standard', {
     method: 'POST',
-    body: JSON.stringify({ project_id: selectedProjectId.value, user_prompts: [] }),
+    body: JSON.stringify({ project_id: selectedProjectId.value, user_prompts: [], chat_history: chatHistory.value }),
   })
 }
 
@@ -175,8 +176,25 @@ async function generateConsolidatedReport() {
   const prompts = message.value.trim() ? [message.value.trim()] : []
   reportResult.value = await apiFetch<ReportResult>('/ai/reports/consolidated', {
     method: 'POST',
-    body: JSON.stringify({ project_id: selectedProjectId.value, user_prompts: prompts }),
+    body: JSON.stringify({ project_id: selectedProjectId.value, user_prompts: prompts, chat_history: chatHistory.value }),
   })
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;')
+}
+
+function renderChatHtml(item: ChatItem): string {
+  if (item.role === 'user') {
+    return `<p>${escapeHtml(item.text).replaceAll('\n', '<br />')}</p>`
+  }
+  const rendered = marked.parse(item.text, { gfm: true, breaks: true })
+  return typeof rendered === 'string' ? rendered : item.text
 }
 </script>
 
@@ -225,7 +243,7 @@ async function generateConsolidatedReport() {
             <div class="chat-role">
               {{ item.role === 'user' ? 'You' : 'AI Assistant' }} · {{ new Date(item.created_at).toLocaleString() }}
             </div>
-            <pre class="reply">{{ item.text }}</pre>
+            <div class="reply" v-html="renderChatHtml(item)" />
           </article>
         </div>
       </div>
@@ -374,10 +392,43 @@ async function generateConsolidatedReport() {
 
 .reply {
   margin: 0;
-  white-space: pre-wrap;
-  font-family: inherit;
   font-size: 0.9375rem;
   line-height: 1.55;
+}
+
+.reply :deep(p) {
+  margin: 0.25rem 0 0.55rem;
+}
+
+.reply :deep(ul),
+.reply :deep(ol) {
+  margin: 0.35rem 0 0.65rem 1.1rem;
+}
+
+.reply :deep(h1),
+.reply :deep(h2),
+.reply :deep(h3),
+.reply :deep(h4) {
+  margin: 0.45rem 0 0.3rem;
+  font-size: 1rem;
+}
+
+.reply :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5rem 0 0.75rem;
+}
+
+.reply :deep(th),
+.reply :deep(td) {
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.reply :deep(th) {
+  background: var(--accent-dim);
 }
 
 .err {
