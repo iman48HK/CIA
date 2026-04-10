@@ -9,6 +9,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -50,6 +51,18 @@ class Project(Base):
         back_populates="project", cascade="all, delete-orphan"
     )
     uploaded_files: Mapped[list["UploadedFile"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    workspace_links: Mapped[list["ProjectWorkspaceLink"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    selected_ordinance_files: Mapped[list["ProjectOrdinanceSelection"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    drawing_uploads: Mapped[list["ProjectDrawingUpload"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    project_uploads: Mapped[list["ProjectFileUpload"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
 
@@ -109,3 +122,93 @@ class OrdinanceFile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     folder: Mapped["OrdinanceFolder"] = relationship(back_populates="files")
+    upload_meta: Mapped["OrdinanceFileUploadMeta | None"] = relationship(
+        back_populates="ordinance_file", cascade="all, delete-orphan"
+    )
+
+
+class OrdinanceFileUploadMeta(Base):
+    __tablename__ = "ordinance_file_upload_meta"
+    __table_args__ = (UniqueConstraint("ordinance_file_id", name="uq_ordinance_file_upload_meta"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    ordinance_file_id: Mapped[int] = mapped_column(
+        ForeignKey("ordinance_files.id"), nullable=False, index=True
+    )
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False, default="application/octet-stream")
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    ordinance_file: Mapped["OrdinanceFile"] = relationship(back_populates="upload_meta")
+
+
+class ProjectWorkspaceFolder(Base):
+    __tablename__ = "project_workspace_folders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    projects: Mapped[list["ProjectWorkspaceLink"]] = relationship(
+        back_populates="workspace_folder", cascade="all, delete-orphan"
+    )
+
+
+class ProjectWorkspaceLink(Base):
+    __tablename__ = "project_workspace_links"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_workspace_project"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    workspace_folder_id: Mapped[int] = mapped_column(
+        ForeignKey("project_workspace_folders.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    project: Mapped["Project"] = relationship(back_populates="workspace_links")
+    workspace_folder: Mapped["ProjectWorkspaceFolder"] = relationship(back_populates="projects")
+
+
+class ProjectDrawingUpload(Base):
+    __tablename__ = "project_drawing_uploads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False, default="application/octet-stream")
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    project: Mapped["Project"] = relationship(back_populates="drawing_uploads")
+
+
+class ProjectFileUpload(Base):
+    __tablename__ = "project_file_uploads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False, default="application/octet-stream")
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    project: Mapped["Project"] = relationship(back_populates="project_uploads")
+
+
+class ProjectOrdinanceSelection(Base):
+    __tablename__ = "project_ordinance_selections"
+    __table_args__ = (
+        UniqueConstraint("project_id", "ordinance_file_id", name="uq_project_ordinance_selection"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    ordinance_file_id: Mapped[int] = mapped_column(ForeignKey("ordinance_files.id"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    project: Mapped["Project"] = relationship(back_populates="selected_ordinance_files")

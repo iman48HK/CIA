@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import get_current_user
-from app.models import Drawing, OrdinanceFile, Project, UploadedFile, User
+from app.models import OrdinanceFile, Project, ProjectDrawingUpload, ProjectFileUpload, User
 from app.schemas import DashboardStats
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -23,11 +23,14 @@ def stats(user: User = Depends(get_current_user), db: Session = Depends(get_db))
         )
 
     d_count = (
-        db.query(func.count(Drawing.id)).filter(Drawing.project_id.in_(project_ids)).scalar() or 0
+        db.query(func.count(ProjectDrawingUpload.id))
+        .filter(ProjectDrawingUpload.project_id.in_(project_ids))
+        .scalar()
+        or 0
     )
     f_count = (
-        db.query(func.count(UploadedFile.id))
-        .filter(UploadedFile.project_id.in_(project_ids))
+        db.query(func.count(ProjectFileUpload.id))
+        .filter(ProjectFileUpload.project_id.in_(project_ids))
         .scalar()
         or 0
     )

@@ -36,6 +36,7 @@ class UserAdminUpdate(BaseModel):
 
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+    workspace_folder_id: int
 
 
 class ProjectFolderCreate(BaseModel):
@@ -50,6 +51,8 @@ class ProjectOut(BaseModel):
     folder_count: int = 0
     drawing_count: int = 0
     file_count: int = 0
+    workspace_folder_id: int | None = None
+    workspace_folder_name: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -63,12 +66,38 @@ class ProjectFolderOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class WorkspaceFolderCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+
+class WorkspaceFolderOut(BaseModel):
+    id: int
+    owner_id: int
+    name: str
+    created_at: datetime
+    project_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+
 class DrawingCreate(BaseModel):
     title: str = Field(min_length=1, max_length=255)
 
 
 class UploadedFileCreate(BaseModel):
     filename: str = Field(min_length=1, max_length=512)
+
+
+class ProjectUploadOut(BaseModel):
+    id: int
+    filename: str
+    content_type: str
+    size_bytes: int
+    created_at: datetime
+
+
+class ProjectOrdinanceSelectionCreate(BaseModel):
+    ordinance_file_ids: list[int] = Field(default_factory=list)
 
 
 class OrdinanceFolderOut(BaseModel):
@@ -84,6 +113,8 @@ class OrdinanceFileOut(BaseModel):
     id: int
     folder_id: int
     title: str
+    content_type: str | None = None
+    size_bytes: int | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

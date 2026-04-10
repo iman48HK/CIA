@@ -3,21 +3,35 @@ definePageMeta({ middleware: 'auth' })
 
 const route = useRoute()
 const folderId = computed(() => Number(route.params.id))
-const { apiFetch } = useApi()
+const { apiFetch, base, token } = useApi()
 const { me, loadMe } = useAuth()
 
 interface FileRow {
   id: number
   title: string
+  content_type?: string | null
+  size_bytes?: number | null
   created_at: string
 }
 
 const files = ref<FileRow[]>([])
 const newTitle = ref('')
+const uploadInput = ref<HTMLInputElement | null>(null)
 const err = ref('')
+const previewUrl = ref('')
+const previewType = ref('')
+const previewName = ref('')
 
 async function load() {
-  files.value = await apiFetch<FileRow[]>(`/ordinance/folders/${folderId.value}/files`)
+  err.value = ''
+  try {
+    files.value = await apiFetch<FileRow[]>(`/ordinance/folders/${folderId.value}/files`)
+  } catch (e: unknown) {
+    err.value =
+      e && typeof e === 'object' && 'data' in e
+        ? String((e as { data?: { detail?: string } }).data?.detail || 'Failed to load ordinance files')
+        : 'Failed to load ordinance files'
+  }
 }
 
 onMounted(async () => {
@@ -37,16 +51,79 @@ async function addFile() {
     })
     newTitle.value = ''
     await load()
-  } catch {
-    err.value = 'Only admins can add ordinance documents.'
+  } catch (e: unknown) {
+    err.value =
+      e && typeof e === 'object' && 'data' in e
+        ? String((e as { data?: { detail?: string } }).data?.detail || 'Failed to add ordinance document')
+        : 'Failed to add ordinance document'
   }
+}
+
+async function uploadFiles() {
+  const picked = uploadInput.value?.files
+  if (!picked?.length) return
+  err.value = ''
+  const fd = new FormData()
+  for (const file of Array.from(picked)) {
+    fd.append('files', file)
+  }
+  try {
+    await apiFetch(`/ordinance/folders/${folderId.value}/upload`, {
+      method: 'POST',
+      body: fd,
+    })
+    if (uploadInput.value) uploadInput.value.value = ''
+    await load()
+  } catch (e: unknown) {
+    err.value =
+      e && typeof e === 'object' && 'data' in e
+        ? String((e as { data?: { detail?: string } }).data?.detail || 'Failed to upload ordinance documents')
+        : 'Failed to upload ordinance documents'
+  }
+}
+
+async function removeFile(fileId: number) {
+  if (!confirm('Delete this ordinance document?')) return
+  try {
+    await apiFetch(`/ordinance/files/${fileId}`, { method: 'DELETE' })
+    await load()
+  } catch (e: unknown) {
+    err.value =
+      e && typeof e === 'object' && 'data' in e
+        ? String((e as { data?: { detail?: string } }).data?.detail || 'Failed to delete ordinance document')
+        : 'Failed to delete ordinance document'
+  }
+}
+
+async function openPreview(file: FileRow) {
+  err.value = ''
+  try {
+    const res = await fetch(`${base()}/ordinance/files/${file.id}/content`, {
+      headers: token.value ? { Authorization: `Bearer ${token.value}` } : {},
+    })
+    if (!res.ok) throw new Error('preview failed')
+    const blob = await res.blob()
+    if (previewUrl.value) URL.revokeObjectURL(previewUrl.value)
+    previewUrl.value = URL.createObjectURL(blob)
+    previewType.value = file.content_type || blob.type || 'application/octet-stream'
+    previewName.value = file.title
+  } catch {
+    err.value = 'Failed to preview ordinance file'
+  }
+}
+
+function closePreview() {
+  if (previewUrl.value) URL.revokeObjectURL(previewUrl.value)
+  previewUrl.value = ''
+  previewType.value = ''
+  previewName.value = ''
 }
 </script>
 
 <template>
   <div>
     <NuxtLink to="/ordinance" class="back">← Ordinance</NuxtLink>
-    <h1>Folder</h1>
+    <h1>Ordinance Folder</h1>
     <p class="muted">Files in this folder</p>
 
     <p v-if="err" class="err">{{ err }}</p>
@@ -57,14 +134,36 @@ async function addFile() {
         <input v-model="newTitle" class="input" placeholder="Document title" @keyup.enter="addFile" />
         <button type="button" class="btn btn-primary" @click="addFile">Add</button>
       </div>
+      <div class="inline">
+        <input ref="uploadInput" type="file" class="input" multiple />
+        <button type="button" class="btn btn-primary" @click="uploadFiles">Upload file(s)</button>
+      </div>
     </div>
 
     <div v-if="!files.length" class="card empty">No files in this folder</div>
     <ul v-else class="list">
       <li v-for="f in files" :key="f.id" class="card file-row">
-        {{ f.title }}
+        <button type="button" class="linkish" @click="openPreview(f)">
+          {{ f.title }}
+          <small v-if="f.size_bytes" class="meta">({{ (f.size_bytes / 1024 / 1024).toFixed(2) }} MB)</small>
+        </button>
+        <button v-if="me?.role === 'admin'" type="button" class="btn btn-ghost danger" @click="removeFile(f.id)">
+          Delete
+        </button>
       </li>
     </ul>
+
+    <div v-if="previewUrl" class="modal-backdrop" @click.self="closePreview">
+      <div class="card modal-card">
+        <div class="modal-head">
+          <strong>{{ previewName }}</strong>
+          <button type="button" class="btn btn-ghost" @click="closePreview">Close</button>
+        </div>
+        <img v-if="previewType.startsWith('image/')" :src="previewUrl" class="preview-media" />
+        <iframe v-else-if="previewType.includes('pdf')" :src="previewUrl" class="preview-media" />
+        <div v-else class="muted">Preview not supported for this file type. Use browser download/open.</div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -113,6 +212,10 @@ h1 {
 
 .file-row {
   padding: 0.85rem 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
 }
 
 .empty {
@@ -123,5 +226,41 @@ h1 {
 
 .err {
   color: #dc2626;
+}
+.linkish {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+  font-size: 1rem;
+  font-weight: 500;
+}
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.45);
+  display: grid;
+  place-items: center;
+  z-index: 40;
+  padding: 1rem;
+}
+.modal-card {
+  width: min(900px, 100%);
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+.preview-media {
+  width: 100%;
+  height: min(75vh, 760px);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  object-fit: contain;
+  background: #fff;
 }
 </style>

@@ -2,7 +2,7 @@
   <div class="guest-wrap">
     <div class="guest-card card">
       <div class="guest-brand">
-        <div class="logo-mark" aria-hidden="true" />
+        <img src="/cia-icon.svg" alt="CIA" class="logo-mark" />
         <div>
           <strong>CIA</strong>
           <div class="sub">Construction Insight Agent</div>
@@ -38,8 +38,6 @@
 .logo-mark {
   width: 40px;
   height: 40px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, #10b981, #059669);
 }
 
 .sub {

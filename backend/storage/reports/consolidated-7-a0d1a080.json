@@ -1,0 +1,40 @@
+{
+  "project_id": 7,
+  "generated_sections": {
+    "4.1": "Space detection, room labels, dimensions, symbols, materials",
+    "4.2": "Gross Floor Area (GFA) vs Usable/Net Area calculation",
+    "4.3": "Space-type summary table with efficiency ratio",
+    "4.4": "Statistical dashboard with total GFA/usable area/pie chart-ready data",
+    "4.5": {
+      "manual_reinspection_required": [
+        {
+          "item": "North stair dimension extraction",
+          "doubt_score": 78,
+          "manual_review_reason": "Low OCR confidence on boundary text"
+        }
+      ]
+    },
+    "4.6": "LLM-generated corrective action suggestions",
+    "4.7": "LangGraph toolchain summary (retrieve/check/summary/area/doubt tools)",
+    "compliance": {
+      "status": "MVP parser output",
+      "citations": [
+        {
+          "section": "HK Code Sec. 12.4",
+          "drawing_page": "A-103"
+        }
+      ]
+    }
+  },
+  "citations": [
+    {
+      "source": "HK regulation sample",
+      "confidence": 0.76,
+      "doubt_score": 24
+    }
+  ],
+  "annotated_preview_note": "Issue overlays should be shown in red on drawing previews.",
+  "selected_user_prompts": [
+    "Conversational agent flow using retrieve/check/summary/area/doubt tools"
+  ]
+}

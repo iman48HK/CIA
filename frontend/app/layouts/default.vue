@@ -37,7 +37,7 @@ const nav = computed(() => {
     { to: '/', label: 'Dashboard', icon: 'home' },
     { to: '/projects', label: 'My Projects', icon: 'folder' },
     { to: '/ordinance', label: 'Ordinance', icon: 'book' },
-    { to: '/assistant', label: 'CIA Assistant', icon: 'spark' },
+    { to: '/assistant', label: 'AI Assistant', icon: 'spark' },
   ]
   if (me.value?.role === 'admin') {
     items.push({ to: '/admin/users', label: 'User Management', icon: 'users' })
@@ -51,13 +51,7 @@ const nav = computed(() => {
     <aside class="sidebar" :class="{ collapsed }">
       <div class="brand">
         <div class="logo" aria-hidden="true">
-          <svg viewBox="0 0 32 32" width="28" height="28" fill="none">
-            <path
-              fill="#10b981"
-              d="M6 26V10l10-6 10 6v16l-10 6-10-6zm10-20.5L8.5 11v12L16 28l7.5-5V11L16 5.5z"
-            />
-            <path fill="#34d399" d="M16 8l6 3.5v9L16 24l-6-3.5v-9L16 8z" opacity=".85" />
-          </svg>
+          <img src="/cia-icon.svg" alt="CIA" width="28" height="28" />
         </div>
         <div v-if="!collapsed" class="brand-text">
           <div class="brand-title">CIA</div>

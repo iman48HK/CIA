@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 
-from app.models import OrdinanceFolder, User, UserRole
+from app.models import User, UserRole
 from app.security import hash_password
 
 
@@ -19,8 +19,5 @@ def seed_if_empty(db: Session) -> None:
             is_active=True,
         )
         db.add_all([admin, user])
-
-    if db.query(OrdinanceFolder).filter(OrdinanceFolder.code == "ORD1").first() is None:
-        db.add(OrdinanceFolder(code="ORD1", name="ORD1"))
 
     db.commit()
