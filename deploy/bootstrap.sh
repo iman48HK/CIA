@@ -5,6 +5,9 @@
 # For a **full** install (Docker + clone + .env + compose) from only SSH, use instead:
 #   curl -fsSL https://raw.githubusercontent.com/iman48HK/CIA/main/deploy/install-remote.sh | bash
 # Or from your laptop:  ssh root@SERVER 'bash -s' < deploy/install-remote.sh
+#
+# After install, diagnose gaps:
+#   curl -fsSL https://raw.githubusercontent.com/iman48HK/CIA/main/deploy/server-check.sh | bash
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
