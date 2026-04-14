@@ -7,6 +7,12 @@ export function useApi() {
   })
 
   const base = () => {
+    if (import.meta.server) {
+      const internal = String(config.apiInternal || '').trim().replace(/\/$/, '')
+      if (internal) {
+        return `${internal}/api`
+      }
+    }
     const root = String(config.public.apiBase || '').replace(/\/$/, '')
     return root ? `${root}/api` : '/api'
   }

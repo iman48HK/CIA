@@ -20,6 +20,9 @@ if [ ! -f .env.deploy ]; then
   exit 0
 fi
 
+docker compose -f docker-compose.prod.yml --env-file .env.deploy pull 2>/dev/null || true
 docker compose -f docker-compose.prod.yml --env-file .env.deploy up -d --build
 
-echo "Services started. Open http://<this-server-ip>:6000 (ensure cloud firewall allows TCP 6000)."
+echo "Services started. Open http://<this-server-ip>:6000"
+echo "If the page loads but login/API fails: check CORS_ORIGINS in .env.deploy matches the exact URL (scheme + host + port)."
+echo "Ensure your cloud firewall allows inbound TCP 6000."
