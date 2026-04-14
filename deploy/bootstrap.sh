@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run on the Linux server as root (once) after cloning or pulling this repo.
+# Usage:  bash deploy/bootstrap.sh
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+if ! command -v docker >/dev/null 2>&1; then
+  apt-get update -y
+  apt-get install -y ca-certificates curl git docker.io docker-compose-plugin
+  systemctl enable --now docker || true
+fi
+
+if [ ! -f .env.deploy ]; then
+  cp deploy/env.deploy.example .env.deploy
+  echo "Created .env.deploy from example — edit JWT_SECRET and OPENROUTER_API_KEY, then run:"
+  echo "  docker compose -f docker-compose.prod.yml --env-file .env.deploy up -d --build"
+  exit 0
+fi
+
+docker compose -f docker-compose.prod.yml --env-file .env.deploy up -d --build
+
+echo "Services started. Open http://<this-server-ip>:6000 (ensure cloud firewall allows TCP 6000)."
