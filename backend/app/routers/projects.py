@@ -20,6 +20,8 @@ from app.models import (
     User,
 )
 from app.schemas import (
+    OrdinanceSelectionRefOut,
+    ProjectAnalysisFilesOut,
     ProjectCreate,
     ProjectFolderCreate,
     ProjectFolderOut,
@@ -304,6 +306,58 @@ def list_project_drawings(
         )
         for r in rows
     ]
+
+
+@router.get("/by-id/{project_id}/analysis-files", response_model=ProjectAnalysisFilesOut)
+def list_project_analysis_files(
+    project_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Drawings, project files, and selected ordinance documents for AI analysis context."""
+    _project(db, project_id, user)
+    drawing_rows = (
+        db.query(ProjectDrawingUpload)
+        .filter(ProjectDrawingUpload.project_id == project_id)
+        .order_by(ProjectDrawingUpload.id.desc())
+        .all()
+    )
+    file_rows = (
+        db.query(ProjectFileUpload)
+        .filter(ProjectFileUpload.project_id == project_id)
+        .order_by(ProjectFileUpload.id.desc())
+        .all()
+    )
+    sel_ids = [
+        oid
+        for (oid,) in db.query(ProjectOrdinanceSelection.ordinance_file_id)
+        .filter(ProjectOrdinanceSelection.project_id == project_id)
+        .all()
+    ]
+    ord_rows = (
+        db.query(OrdinanceFile.id, OrdinanceFile.title).filter(OrdinanceFile.id.in_(sel_ids)).all() if sel_ids else []
+    )
+    return ProjectAnalysisFilesOut(
+        drawings=[
+            ProjectUploadOut(
+                id=r.id,
+                filename=r.filename,
+                content_type=r.content_type,
+                size_bytes=r.size_bytes,
+                created_at=r.created_at,
+            )
+            for r in drawing_rows
+        ],
+        project_files=[
+            ProjectUploadOut(
+                id=r.id,
+                filename=r.filename,
+                content_type=r.content_type,
+                size_bytes=r.size_bytes,
+                created_at=r.created_at,
+            )
+            for r in file_rows
+        ],
+        ordinances=[OrdinanceSelectionRefOut(id=oid, title=title) for oid, title in ord_rows],
+    )
 
 
 @router.delete("/by-id/{project_id}/drawings/{drawing_id}")

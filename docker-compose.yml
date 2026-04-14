@@ -7,6 +7,8 @@ services:
       POSTGRES_DB: cia
     ports:
       - "5432:5432"
+      # Host 5433 for local .env variants that point at postgres on 5433
+      - "5433:5432"
     volumes:
       - cia_pgdata:/var/lib/postgresql/data
 

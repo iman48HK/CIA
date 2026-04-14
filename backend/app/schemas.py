@@ -106,6 +106,17 @@ class ProjectUploadOut(BaseModel):
     created_at: datetime
 
 
+class OrdinanceSelectionRefOut(BaseModel):
+    id: int
+    title: str
+
+
+class ProjectAnalysisFilesOut(BaseModel):
+    drawings: list[ProjectUploadOut]
+    project_files: list[ProjectUploadOut]
+    ordinances: list[OrdinanceSelectionRefOut]
+
+
 class ProjectOrdinanceSelectionCreate(BaseModel):
     ordinance_file_ids: list[int] = Field(default_factory=list)
 

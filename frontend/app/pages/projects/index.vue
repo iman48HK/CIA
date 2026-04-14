@@ -180,15 +180,31 @@ async function deleteFolder(folderId: number) {
         <ul class="folder-list">
           <li v-for="wf in workspaceFolders" :key="wf.id" class="folder-row">
             <template v-if="editingFolderId === wf.id">
-              <input v-model="editingFolderName" class="input" />
-              <button type="button" class="btn btn-primary" @click="saveEditFolder(wf.id)">Save</button>
-              <button type="button" class="btn btn-ghost" @click="cancelEditFolder">Cancel</button>
+              <input v-model="editingFolderName" class="input" @keydown.enter.prevent="saveEditFolder(wf.id)" />
+              <button type="button" class="icon-btn confirm" title="Save folder name" @click="saveEditFolder(wf.id)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M9 16.2l-3.5-3.5L4 14.2l5 5L20 8.2 18.5 6.8z" />
+                </svg>
+              </button>
+              <button type="button" class="icon-btn" title="Cancel edit" @click="cancelEditFolder">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M18.3 5.71L12 12l6.3 6.29-1.41 1.41L10.59 13.41 4.29 19.7 2.88 18.29 9.17 12 2.88 5.71 4.29 4.3l6.3 6.29 6.29-6.29z" />
+                </svg>
+              </button>
             </template>
             <template v-else>
               <span>{{ wf.name }} <small class="meta">({{ wf.project_count }} projects)</small></span>
               <div class="row">
-                <button type="button" class="btn btn-ghost" @click="startEditFolder(wf)">Edit</button>
-                <button type="button" class="btn btn-ghost danger" @click="deleteFolder(wf.id)">Delete</button>
+                <button type="button" class="icon-btn" title="Edit folder name" @click="startEditFolder(wf)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M3 17.25V21h3.75l11-11-3.75-3.75-11 11zM20.71 7.04a1 1 0 000-1.41L18.37 3.29a1 1 0 00-1.41 0L15.13 5.12l3.75 3.75 1.83-1.83z" />
+                  </svg>
+                </button>
+                <button type="button" class="icon-btn danger" title="Delete folder" @click="deleteFolder(wf.id)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
+                  </svg>
+                </button>
               </div>
             </template>
           </li>
@@ -310,6 +326,33 @@ async function deleteFolder(folderId: number) {
 }
 .danger {
   color: #dc2626 !important;
+}
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  background: var(--main-bg);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.icon-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+.icon-btn.confirm:hover {
+  color: #16a34a;
+  border-color: #16a34a;
+  background: rgba(22, 163, 74, 0.1);
+}
+.icon-btn.danger:hover {
+  color: #dc2626;
+  border-color: #dc2626;
+  background: rgba(220, 38, 38, 0.1);
 }
 
 .section-title {

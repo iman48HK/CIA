@@ -15,7 +15,6 @@ interface FileRow {
 }
 
 const files = ref<FileRow[]>([])
-const newTitle = ref('')
 const uploadInput = ref<HTMLInputElement | null>(null)
 const err = ref('')
 const previewUrl = ref('')
@@ -40,24 +39,6 @@ onMounted(async () => {
 })
 
 watch(folderId, load)
-
-async function addFile() {
-  if (!newTitle.value.trim()) return
-  err.value = ''
-  try {
-    await apiFetch(`/ordinance/folders/${folderId.value}/files`, {
-      method: 'POST',
-      body: JSON.stringify({ title: newTitle.value.trim() }),
-    })
-    newTitle.value = ''
-    await load()
-  } catch (e: unknown) {
-    err.value =
-      e && typeof e === 'object' && 'data' in e
-        ? String((e as { data?: { detail?: string } }).data?.detail || 'Failed to add ordinance document')
-        : 'Failed to add ordinance document'
-  }
-}
 
 async function uploadFiles() {
   const picked = uploadInput.value?.files
@@ -129,11 +110,6 @@ function closePreview() {
     <p v-if="err" class="err">{{ err }}</p>
 
     <div v-if="me?.role === 'admin'" class="card admin-add">
-      <strong>Add document (admin)</strong>
-      <div class="inline">
-        <input v-model="newTitle" class="input" placeholder="Document title" @keyup.enter="addFile" />
-        <button type="button" class="btn btn-primary" @click="addFile">Add</button>
-      </div>
       <div class="inline">
         <input ref="uploadInput" type="file" class="input" multiple />
         <button type="button" class="btn btn-primary" @click="uploadFiles">Upload file(s)</button>
@@ -148,7 +124,9 @@ function closePreview() {
           <small v-if="f.size_bytes" class="meta">({{ (f.size_bytes / 1024 / 1024).toFixed(2) }} MB)</small>
         </button>
         <button v-if="me?.role === 'admin'" type="button" class="btn btn-ghost danger" @click="removeFile(f.id)">
-          Delete
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
+          </svg>
         </button>
       </li>
     </ul>
@@ -216,6 +194,11 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
+}
+.danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .empty {

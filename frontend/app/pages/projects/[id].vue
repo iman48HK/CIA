@@ -177,7 +177,11 @@ function closePreview() {
             {{ project.file_count }} files
           </p>
         </div>
-        <button type="button" class="btn btn-ghost danger" @click="removeProject">Delete project</button>
+        <button type="button" class="icon-btn danger" title="Delete project" @click="removeProject">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
+          </svg>
+        </button>
       </header>
 
       <div class="cols">
@@ -193,7 +197,11 @@ function closePreview() {
               <button type="button" class="linkish" @click="openPreview('drawing', f)">
                 {{ f.filename }} ({{ (f.size_bytes / 1024 / 1024).toFixed(2) }} MB)
               </button>
-              <button type="button" class="btn btn-ghost danger" @click="removeDrawing(f.id)">Delete</button>
+              <button type="button" class="icon-btn danger" title="Delete drawing" @click="removeDrawing(f.id)">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
+                </svg>
+              </button>
             </li>
             <li v-if="!drawingUploads.length" class="muted">No drawings uploaded yet</li>
           </ul>
@@ -211,7 +219,11 @@ function closePreview() {
               <button type="button" class="linkish" @click="openPreview('project-file', f)">
                 {{ f.filename }} ({{ (f.size_bytes / 1024 / 1024).toFixed(2) }} MB)
               </button>
-              <button type="button" class="btn btn-ghost danger" @click="removeProjectFile(f.id)">Delete</button>
+              <button type="button" class="icon-btn danger" title="Delete project file" @click="removeProjectFile(f.id)">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
+                </svg>
+              </button>
             </li>
             <li v-if="!projectUploads.length" class="muted">No project files uploaded</li>
           </ul>
@@ -291,6 +303,28 @@ function closePreview() {
 
 .danger {
   color: #dc2626 !important;
+}
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  background: var(--main-bg);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.icon-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+.icon-btn.danger:hover {
+  color: #dc2626;
+  border-color: #dc2626;
+  background: rgba(220, 38, 38, 0.1);
 }
 
 .cols {

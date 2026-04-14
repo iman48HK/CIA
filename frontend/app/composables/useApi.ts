@@ -6,7 +6,10 @@ export function useApi() {
     path: '/',
   })
 
-  const base = () => `${config.public.apiBase}/api`
+  const base = () => {
+    const root = String(config.public.apiBase || '').replace(/\/$/, '')
+    return root ? `${root}/api` : '/api'
+  }
 
   async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
     const headers: Record<string, string> = {

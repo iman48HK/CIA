@@ -25,6 +25,10 @@ class OrdinanceFolderCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
 
 
+class OrdinanceFolderRename(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+
 @router.get("/folders", response_model=list[OrdinanceFolderOut])
 def list_folders(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     folders = db.query(OrdinanceFolder).order_by(OrdinanceFolder.id).all()
@@ -53,6 +57,22 @@ def create_folder(
     return OrdinanceFolderOut(
         id=folder.id, code=folder.code, name=folder.name, file_count=0
     )
+
+
+@router.patch("/folders/{folder_id}", response_model=OrdinanceFolderOut)
+def rename_folder(
+    folder_id: int,
+    body: OrdinanceFolderRename,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    folder = db.query(OrdinanceFolder).filter(OrdinanceFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    folder.name = body.name.strip()
+    db.commit()
+    cnt = db.query(OrdinanceFile).filter(OrdinanceFile.folder_id == folder.id).count()
+    return OrdinanceFolderOut(id=folder.id, code=folder.code, name=folder.name, file_count=cnt)
 
 
 @router.delete("/folders/{folder_id}")
