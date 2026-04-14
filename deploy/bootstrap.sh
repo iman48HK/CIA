@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Run on the Linux server as root (once) after cloning or pulling this repo.
+# Run on the Linux server as root from a **git clone** of this repo (repo root).
 # Usage:  bash deploy/bootstrap.sh
+#
+# For a **full** install (Docker + clone + .env + compose) from only SSH, use instead:
+#   curl -fsSL https://raw.githubusercontent.com/iman48HK/CIA/main/deploy/install-remote.sh | bash
+# Or from your laptop:  ssh root@SERVER 'bash -s' < deploy/install-remote.sh
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
