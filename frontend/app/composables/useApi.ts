@@ -6,14 +6,19 @@ export function useApi() {
     path: '/',
   })
 
+  const normalizeApiRoot = (raw: string) => {
+    const trimmed = String(raw || '').trim().replace(/\/$/, '')
+    return trimmed.replace(/\/api$/i, '')
+  }
+
   const base = () => {
     if (import.meta.server) {
-      const internal = String(config.apiInternal || '').trim().replace(/\/$/, '')
+      const internal = normalizeApiRoot(String(config.apiInternal || ''))
       if (internal) {
         return `${internal}/api`
       }
     }
-    const root = String(config.public.apiBase || '').replace(/\/$/, '')
+    const root = normalizeApiRoot(String(config.public.apiBase || ''))
     return root ? `${root}/api` : '/api'
   }
 

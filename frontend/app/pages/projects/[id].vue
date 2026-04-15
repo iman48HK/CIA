@@ -10,6 +10,14 @@ interface Project {
   name: string
   drawing_count: number
   file_count: number
+  workspace_folder_id: number | null
+  workspace_folder_name: string | null
+}
+
+interface WorkspaceFolder {
+  id: number
+  name: string
+  project_count: number
 }
 
 interface UploadRow {
@@ -35,6 +43,9 @@ const project = ref<Project | null>(null)
 const drawingUploads = ref<UploadRow[]>([])
 const projectUploads = ref<UploadRow[]>([])
 const ordinanceFolders = ref<OrdinanceFolder[]>([])
+const workspaceFolders = ref<WorkspaceFolder[]>([])
+const selectedWorkspaceFolderId = ref<number | null>(null)
+const editingWorkspaceFolderName = ref('')
 const ordinanceFiles = ref<OrdinanceFile[]>([])
 const selectedOrdinanceFileIds = ref<number[]>([])
 const drawingInput = ref<HTMLInputElement | null>(null)
@@ -49,6 +60,10 @@ async function load() {
   err.value = ''
   try {
     project.value = await apiFetch<Project>(`/projects/by-id/${id.value}`)
+    workspaceFolders.value = await apiFetch<WorkspaceFolder[]>('/projects/workspaces/folders')
+    selectedWorkspaceFolderId.value = project.value.workspace_folder_id
+    const selectedFolder = workspaceFolders.value.find((wf) => wf.id === selectedWorkspaceFolderId.value)
+    editingWorkspaceFolderName.value = selectedFolder?.name || ''
     drawingUploads.value = await apiFetch<UploadRow[]>(`/projects/by-id/${id.value}/drawings`)
     projectUploads.value = await apiFetch<UploadRow[]>(`/projects/by-id/${id.value}/project-files`)
     selectedOrdinanceFileIds.value = await apiFetch<number[]>(`/projects/by-id/${id.value}/ordinance-selections`)
@@ -59,14 +74,48 @@ async function load() {
       allFiles.push(...files)
     }
     ordinanceFiles.value = allFiles
+    await nextTick()
+    scrollToRouteHash()
   } catch {
     err.value = 'Project not found'
     project.value = null
   }
 }
 
+function scrollToRouteHash() {
+  if (!import.meta.client || !route.hash) return
+  nextTick(() => {
+    const el = document.querySelector(route.hash)
+    el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+}
+
 onMounted(load)
 watch(id, load)
+watch(
+  () => [route.hash, project.value?.id] as const,
+  () => {
+    if (project.value) scrollToRouteHash()
+  }
+)
+
+async function saveProjectFolder() {
+  if (!selectedWorkspaceFolderId.value) return
+  await apiFetch(`/projects/by-id/${id.value}`, {
+    method: 'PUT',
+    body: JSON.stringify({ workspace_folder_id: selectedWorkspaceFolderId.value }),
+  })
+  await load()
+}
+
+async function saveWorkspaceFolderName() {
+  if (!selectedWorkspaceFolderId.value || !editingWorkspaceFolderName.value.trim()) return
+  await apiFetch(`/projects/workspaces/folders/${selectedWorkspaceFolderId.value}`, {
+    method: 'PUT',
+    body: JSON.stringify({ name: editingWorkspaceFolderName.value.trim() }),
+  })
+  await load()
+}
 
 async function uploadDrawings() {
   const files = drawingInput.value?.files
@@ -118,7 +167,7 @@ async function removeProjectFile(uploadId: number) {
 
 function toggleOrdinance(fileId: number) {
   if (selectedOrdinanceFileIds.value.includes(fileId)) {
-    selectedOrdinanceFileIds.value = selectedOrdinanceFileIds.value.filter((id) => id !== fileId)
+    selectedOrdinanceFileIds.value = selectedOrdinanceFileIds.value.filter((i) => i !== fileId)
     return
   }
   selectedOrdinanceFileIds.value = [...selectedOrdinanceFileIds.value, fileId]
@@ -162,19 +211,22 @@ function closePreview() {
   previewName.value = ''
   previewType.value = ''
 }
+
+function fmtMb(row: UploadRow) {
+  return (row.size_bytes / 1024 / 1024).toFixed(2)
+}
 </script>
 
 <template>
-  <div>
+  <div class="page">
     <NuxtLink to="/projects" class="back">← My Projects</NuxtLink>
 
     <template v-if="project">
       <header class="page-head">
         <div>
           <h1>{{ project.name }}</h1>
-          <p class="muted">
-            {{ project.drawing_count }} drawings ·
-            {{ project.file_count }} files
+          <p class="muted meta-line">
+            {{ project.drawing_count }} drawings · {{ project.file_count }} files
           </p>
         </div>
         <button type="button" class="icon-btn danger" title="Delete project" @click="removeProject">
@@ -184,71 +236,103 @@ function closePreview() {
         </button>
       </header>
 
-      <div class="cols">
-        <section class="card block">
-          <h2>Drawings</h2>
-          <p class="muted small">Upload one or more drawing files (required, each <= 10MB).</p>
-          <div class="inline upload">
-            <input ref="drawingInput" type="file" class="input" multiple />
-            <button type="button" class="btn btn-primary" @click="uploadDrawings">Upload</button>
+      <div class="workspace card">
+        <section id="project-folder" class="ws-section">
+          <div class="ws-section-title">Workspace folder</div>
+          <div class="ws-row">
+            <select v-model.number="selectedWorkspaceFolderId" class="input ws-grow">
+              <option :value="null" disabled>Select folder</option>
+              <option v-for="wf in workspaceFolders" :key="wf.id" :value="wf.id">
+                {{ wf.name }} ({{ wf.project_count }} projects)
+              </option>
+            </select>
+            <button
+              type="button"
+              class="btn btn-primary"
+              :disabled="!selectedWorkspaceFolderId || selectedWorkspaceFolderId === project.workspace_folder_id"
+              @click="saveProjectFolder"
+            >
+              Save
+            </button>
           </div>
-          <ul class="list">
-            <li v-for="f in drawingUploads" :key="f.id" class="list-row">
-              <button type="button" class="linkish" @click="openPreview('drawing', f)">
-                {{ f.filename }} ({{ (f.size_bytes / 1024 / 1024).toFixed(2) }} MB)
-              </button>
-              <button type="button" class="icon-btn danger" title="Delete drawing" @click="removeDrawing(f.id)">
+          <div class="ws-row ws-row-tight">
+            <input v-model="editingWorkspaceFolderName" class="input ws-grow" placeholder="Folder display name" />
+            <button type="button" class="btn btn-outline" :disabled="!selectedWorkspaceFolderId" @click="saveWorkspaceFolderName">
+              Rename folder
+            </button>
+          </div>
+        </section>
+
+        <section id="project-drawings" class="ws-section">
+          <div class="ws-section-head">
+            <div>
+              <div class="ws-section-title">Drawings</div>
+              <p class="muted tiny">Required for analysis. Each file up to 10 MB.</p>
+            </div>
+            <div class="ws-upload-inline">
+              <input ref="drawingInput" type="file" class="visually-hidden" multiple />
+              <button type="button" class="btn btn-outline btn-sm" @click="drawingInput?.click()">Choose files</button>
+              <button type="button" class="btn btn-primary btn-sm" @click="uploadDrawings">Upload</button>
+            </div>
+          </div>
+          <ul class="ws-list">
+            <li v-for="f in drawingUploads" :key="f.id" class="ws-list-row">
+              <button type="button" class="file-link" @click="openPreview('drawing', f)">{{ f.filename }}</button>
+              <span class="muted tiny ws-meta">{{ fmtMb(f) }} MB</span>
+              <button type="button" class="icon-btn danger tiny" title="Remove" @click="removeDrawing(f.id)">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
                 </svg>
               </button>
             </li>
-            <li v-if="!drawingUploads.length" class="muted">No drawings uploaded yet</li>
+            <li v-if="!drawingUploads.length" class="ws-empty">No drawings yet — add files above.</li>
           </ul>
         </section>
 
-        <section class="card block">
-          <h2>Project Files (Optional)</h2>
-          <p class="muted small">Upload project files (each <= 10MB).</p>
-          <div class="inline upload">
-            <input ref="projectFileInput" type="file" class="input" multiple />
-            <button type="button" class="btn btn-primary" @click="uploadProjectFiles">Upload</button>
+        <section id="project-files" class="ws-section">
+          <div class="ws-section-head">
+            <div>
+              <div class="ws-section-title">Project files</div>
+              <p class="muted tiny">Optional supporting files (each up to 10 MB).</p>
+            </div>
+            <div class="ws-upload-inline">
+              <input ref="projectFileInput" type="file" class="visually-hidden" multiple />
+              <button type="button" class="btn btn-outline btn-sm" @click="projectFileInput?.click()">Choose files</button>
+              <button type="button" class="btn btn-primary btn-sm" @click="uploadProjectFiles">Upload</button>
+            </div>
           </div>
-          <ul class="list">
-            <li v-for="f in projectUploads" :key="f.id" class="list-row">
-              <button type="button" class="linkish" @click="openPreview('project-file', f)">
-                {{ f.filename }} ({{ (f.size_bytes / 1024 / 1024).toFixed(2) }} MB)
-              </button>
-              <button type="button" class="icon-btn danger" title="Delete project file" @click="removeProjectFile(f.id)">
+          <ul class="ws-list">
+            <li v-for="f in projectUploads" :key="f.id" class="ws-list-row">
+              <button type="button" class="file-link" @click="openPreview('project-file', f)">{{ f.filename }}</button>
+              <span class="muted tiny ws-meta">{{ fmtMb(f) }} MB</span>
+              <button type="button" class="icon-btn danger tiny" title="Remove" @click="removeProjectFile(f.id)">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
                 </svg>
               </button>
             </li>
-            <li v-if="!projectUploads.length" class="muted">No project files uploaded</li>
+            <li v-if="!projectUploads.length" class="ws-empty">No project files — upload if needed.</li>
           </ul>
         </section>
 
-        <section class="card block">
-          <h2>Selected Ordinance Files (Required)</h2>
-          <p class="muted small">Select one or more ordinance files. You can unselect and save changes.</p>
-          <ul class="list ordinance-list">
-            <li v-for="o in ordinanceFiles" :key="o.id" class="list-row">
-              <label class="check">
-                <input
-                  type="checkbox"
-                  :checked="selectedOrdinanceFileIds.includes(o.id)"
-                  @change="toggleOrdinance(o.id)"
-                />
+        <section id="project-ordinance" class="ws-section ws-section-last">
+          <div class="ws-section-head">
+            <div>
+              <div class="ws-section-title">Ordinance documents</div>
+              <p class="muted tiny">Select at least one document for AI and compliance context.</p>
+            </div>
+            <button type="button" class="btn btn-primary btn-sm" @click="saveOrdinanceSelection">Save selection</button>
+          </div>
+          <p v-if="saveOrdinanceMessage" class="save-hint muted tiny">{{ saveOrdinanceMessage }}</p>
+          <ul class="ws-list ordinance-scroll">
+            <li v-for="o in ordinanceFiles" :key="o.id" class="ws-list-row ordinance-row">
+              <label class="ord-label">
+                <input type="checkbox" :checked="selectedOrdinanceFileIds.includes(o.id)" @change="toggleOrdinance(o.id)" />
                 <span>{{ o.title }}</span>
               </label>
             </li>
-            <li v-if="!ordinanceFiles.length" class="muted">No ordinance files available. Ask admin to add them.</li>
+            <li v-if="!ordinanceFiles.length" class="ws-empty">No ordinance files in the library. Ask an admin to add documents.</li>
           </ul>
-          <div class="inline">
-            <button type="button" class="btn btn-primary" @click="saveOrdinanceSelection">Save Selection</button>
-            <span class="muted small">{{ saveOrdinanceMessage }}</span>
-          </div>
         </section>
       </div>
     </template>
@@ -270,6 +354,10 @@ function closePreview() {
 </template>
 
 <style scoped>
+.page {
+  max-width: 720px;
+}
+
 .back {
   display: inline-block;
   margin-bottom: 1rem;
@@ -283,7 +371,7 @@ function closePreview() {
   justify-content: space-between;
   align-items: flex-start;
   gap: 1rem;
-  margin-bottom: 1.5rem;
+  margin-bottom: 1.25rem;
 }
 
 .page-head h1 {
@@ -293,17 +381,179 @@ function closePreview() {
 
 .muted {
   color: var(--text-muted);
+}
+
+.meta-line {
   margin: 0.35rem 0 0;
+  font-size: 0.9rem;
 }
 
-.muted.small {
+.tiny {
+  font-size: 0.8125rem;
+  margin: 0.2rem 0 0;
+}
+
+.workspace {
+  padding: 0;
+  overflow: hidden;
+}
+
+.ws-section {
+  padding: 1rem 1.1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.ws-section-last {
+  border-bottom: none;
+}
+
+.ws-section-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+
+.ws-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.65rem;
+}
+
+.ws-section-head .ws-section-title {
+  margin-bottom: 0.15rem;
+}
+
+.ws-upload-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.ws-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.ws-row:last-child {
+  margin-bottom: 0;
+}
+
+.ws-row-tight {
+  margin-bottom: 0;
+}
+
+.ws-grow {
+  flex: 1;
+  min-width: 160px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.btn-sm {
+  font-size: 0.8125rem;
+  padding: 0.35rem 0.65rem;
+}
+
+.ws-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.ws-list-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0;
+  border-top: 1px solid var(--border);
+}
+
+.ws-list-row:first-child {
+  border-top: none;
+}
+
+.file-link {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 500;
+  color: var(--accent);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-link:hover {
+  text-decoration: underline;
+}
+
+.ws-meta {
+  flex-shrink: 0;
+}
+
+.ws-empty {
+  padding: 0.65rem 0 0.15rem;
+  color: var(--text-muted);
   font-size: 0.875rem;
-  margin: 0 0 0.75rem;
 }
 
-.danger {
-  color: #dc2626 !important;
+.ordinance-scroll {
+  max-height: 280px;
+  overflow: auto;
+  margin-top: 0.25rem;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  padding: 0 0.5rem;
 }
+
+.ordinance-row {
+  padding-left: 0.15rem;
+  padding-right: 0.15rem;
+}
+
+.ord-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  flex: 1;
+}
+
+.save-hint {
+  margin: 0 0 0.35rem;
+}
+
+.err {
+  color: #dc2626;
+}
+
 .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -316,77 +566,24 @@ function closePreview() {
   color: var(--text-muted);
   cursor: pointer;
 }
+
 .icon-btn:hover {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-dim);
 }
+
 .icon-btn.danger:hover {
   color: #dc2626;
   border-color: #dc2626;
   background: rgba(220, 38, 38, 0.1);
 }
 
-.cols {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 1rem;
+.icon-btn.tiny {
+  width: 30px;
+  height: 30px;
 }
 
-.block h2 {
-  margin: 0 0 0.75rem;
-  font-size: 1rem;
-}
-
-.list {
-  margin: 0 0 1rem;
-  padding-left: 1.25rem;
-}
-
-.inline {
-  display: flex;
-  gap: 0.5rem;
-}
-.inline.upload {
-  margin-bottom: 0.75rem;
-}
-
-.inline .input {
-  flex: 1;
-}
-
-.list-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  margin-bottom: 0.4rem;
-}
-
-.check {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.ordinance-list {
-  max-height: 220px;
-  overflow: auto;
-}
-
-.err {
-  color: #dc2626;
-}
-.linkish {
-  border: none;
-  background: transparent;
-  color: var(--accent);
-  text-align: left;
-  cursor: pointer;
-  padding: 0;
-  font-size: 1rem;
-  font-weight: 500;
-}
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -396,15 +593,18 @@ function closePreview() {
   z-index: 40;
   padding: 1rem;
 }
+
 .modal-card {
   width: min(900px, 100%);
 }
+
 .modal-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 0.5rem;
 }
+
 .preview-media {
   width: 100%;
   height: min(75vh, 760px);

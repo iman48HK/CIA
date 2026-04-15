@@ -49,6 +49,10 @@ class ProjectCreate(BaseModel):
     workspace_folder_id: int
 
 
+class ProjectUpdate(BaseModel):
+    workspace_folder_id: int
+
+
 class ProjectFolderCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
 

@@ -34,6 +34,7 @@ type ReportResult = {
   downloads: Record<string, string>
 }
 const reportResult = ref<ReportResult | null>(null)
+const consolidatedReport = ref<ReportResult | null>(null)
 const projectReady = ref(false)
 const readinessHint = ref('Choose a project before asking.')
 const showPrompts = ref(true)
@@ -52,6 +53,24 @@ const newPresetText = ref('')
 
 type ChatItem = { id: string; role: 'user' | 'assistant'; text: string; created_at: string }
 const chatHistory = ref<ChatItem[]>([])
+
+type ChatTurn = { user: ChatItem; assistant: ChatItem | null }
+
+const chatTurns = computed<ChatTurn[]>(() => {
+  const turns: ChatTurn[] = []
+  let pending: ChatItem | null = null
+  for (const m of chatHistory.value) {
+    if (m.role === 'user') {
+      if (pending) turns.push({ user: pending, assistant: null })
+      pending = m
+    } else if (pending) {
+      turns.push({ user: pending, assistant: m })
+      pending = null
+    }
+  }
+  if (pending) turns.push({ user: pending, assistant: null })
+  return turns
+})
 
 type CollectedItem = {
   id: string
@@ -77,6 +96,7 @@ const annotationMarkers = ref<AnnotationMarker[]>([])
 const annotationAssets = ref<AnnotationAsset[]>([])
 const annotationCanvas = ref<HTMLCanvasElement | null>(null)
 const annotationImg = ref<HTMLImageElement | null>(null)
+const openDownloadMenuId = ref('')
 
 function storageKeyChat(projectId: number | null): string | null {
   return projectId ? `cia_chat_history_${projectId}` : null
@@ -245,6 +265,42 @@ function extensionForReportKey(key: string): string {
   return key
 }
 
+type DownloadOption = {
+  key: string
+  label: string
+  onSelect: () => void | Promise<void>
+}
+
+function toggleDownloadMenu(id: string) {
+  openDownloadMenuId.value = openDownloadMenuId.value === id ? '' : id
+}
+
+function closeDownloadMenu() {
+  openDownloadMenuId.value = ''
+}
+
+function turnCombinedPlain(turn: ChatTurn): string {
+  const u = `You · ${turn.user.created_at}\n\n${turn.user.text}`
+  if (!turn.assistant) return `${u}\n\n—\n\n(No assistant reply yet.)`
+  return `${u}\n\n—\n\nAI Assistant · ${turn.assistant.created_at}\n\n${turn.assistant.text}`
+}
+
+function chatTurnDownloadOptions(turn: ChatTurn): DownloadOption[] {
+  return [
+    { key: 'txt', label: 'TXT', onSelect: () => downloadTurnExport(turn, 'txt') },
+    { key: 'md', label: 'Markdown', onSelect: () => downloadTurnExport(turn, 'md') },
+    { key: 'html', label: 'HTML', onSelect: () => downloadTurnExport(turn, 'html') },
+  ]
+}
+
+function reportDownloadOptions(report: ReportResult): DownloadOption[] {
+  return Object.entries(report.downloads).map(([key, path]) => ({
+    key,
+    label: key.toUpperCase(),
+    onSelect: () => downloadReport(path, key),
+  }))
+}
+
 async function downloadReport(path: string, key: string) {
   error.value = ''
   try {
@@ -288,31 +344,32 @@ function buildExportHeader(title: string): string {
   return `Title: ${title}\nAuthor: ${who}\nGenerated: ${when}\n${'─'.repeat(48)}\n\n`
 }
 
-function downloadChatExport(item: ChatItem, format: 'txt' | 'md' | 'html') {
-  const title = item.role === 'user' ? 'User message' : 'AI Assistant reply'
+function downloadTurnExport(turn: ChatTurn, format: 'txt' | 'md' | 'html') {
+  const title = 'Chat exchange'
   const header = buildExportHeader(title)
-  const roleLabel = item.role === 'user' ? 'You' : 'AI Assistant'
   const who = reportAuthor.value || 'User'
   const when = new Date().toLocaleString()
   if (format === 'txt') {
-    const body = `${roleLabel} · ${item.created_at}\n\n${item.text}`
-    downloadTextFile(`cia-${item.id}.txt`, header + body, 'text/plain;charset=utf-8')
+    downloadTextFile(`cia-turn-${turn.user.id}.txt`, header + turnCombinedPlain(turn), 'text/plain;charset=utf-8')
     return
   }
   if (format === 'md') {
     const md =
       `# ${title}\n\n` +
-      `**Author:** ${who}  \n**Generated:** ${when}  \n**Message time:** ${item.created_at}\n\n---\n\n` +
-      `## ${roleLabel}\n\n${item.text}\n`
-    downloadTextFile(`cia-${item.id}.md`, md, 'text/markdown;charset=utf-8')
+      `**Author:** ${who}  \n**Exported:** ${when}  \n\n---\n\n` +
+      `## You · ${turn.user.created_at}\n\n${turn.user.text}\n\n---\n\n` +
+      (turn.assistant
+        ? `## AI Assistant · ${turn.assistant.created_at}\n\n${turn.assistant.text}\n`
+        : `## AI Assistant\n\n_(No reply yet.)_\n`)
+    downloadTextFile(`cia-turn-${turn.user.id}.md`, md, 'text/markdown;charset=utf-8')
     return
   }
-  const inner =
-    item.role === 'assistant'
-      ? (typeof marked.parse(item.text, { gfm: true, breaks: true }) === 'string'
-          ? (marked.parse(item.text, { gfm: true, breaks: true }) as string)
-          : escapeHtml(item.text))
-      : `<p>${escapeHtml(item.text).replaceAll('\n', '<br />')}</p>`
+  const userInner = `<p>${escapeHtml(turn.user.text).replaceAll('\n', '<br />')}</p>`
+  const assistInner = turn.assistant
+    ? typeof marked.parse(turn.assistant.text, { gfm: true, breaks: true }) === 'string'
+      ? (marked.parse(turn.assistant.text, { gfm: true, breaks: true }) as string)
+      : escapeHtml(turn.assistant.text)
+    : '<p class="pending">No reply yet.</p>'
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -322,6 +379,8 @@ function downloadChatExport(item: ChatItem, format: 'txt' | 'md' | 'html') {
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #0f172a; line-height: 1.55; }
     .meta { color: #64748b; font-size: 0.9rem; margin-bottom: 1.25rem; border-bottom: 1px solid #e2e8f0; padding-bottom: 0.75rem; }
     .meta strong { color: #334155; }
+    h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; color: #334155; }
+    .pending { color: #64748b; font-style: italic; }
     table { border-collapse: collapse; width: 100%; margin: 0.75rem 0; }
     th, td { border: 1px solid #e2e8f0; padding: 0.4rem 0.5rem; }
     th { background: #f1f5f9; }
@@ -330,36 +389,25 @@ function downloadChatExport(item: ChatItem, format: 'txt' | 'md' | 'html') {
 <body>
   <h1>${escapeHtml(title)}</h1>
   <div class="meta">
-    <div><strong>Author</strong> ${escapeHtml(reportAuthor.value || 'User')}</div>
-    <div><strong>Message time</strong> ${escapeHtml(item.created_at)}</div>
+    <div><strong>Author</strong> ${escapeHtml(who)}</div>
+    <div><strong>Exported</strong> ${escapeHtml(when)}</div>
   </div>
-  <div class="body">${inner}</div>
+  <h2>You</h2>
+  <div class="body">${userInner}</div>
+  <h2>AI Assistant</h2>
+  <div class="body">${assistInner}</div>
 </body>
 </html>`
-  downloadTextFile(`cia-${item.id}.html`, html, 'text/html;charset=utf-8')
+  downloadTextFile(`cia-turn-${turn.user.id}.html`, html, 'text/html;charset=utf-8')
 }
 
-function collectChatMessage(item: ChatItem) {
-  const label = item.role === 'user' ? 'User message' : 'AI reply'
+function collectChatTurn(turn: ChatTurn) {
   collectedOutputs.value.push({
     id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-    source: 'chat',
-    label,
-    text: item.text,
-    created_at: item.created_at,
-  })
-  persistCollected(selectedProjectId.value)
-}
-
-function collectCurrentReport() {
-  if (!reportResult.value) return
-  const text = JSON.stringify(reportResult.value.payload, null, 2)
-  collectedOutputs.value.push({
-    id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-    source: `report:${reportResult.value.report_type}`,
-    label: `Report ${reportResult.value.report_id}`,
-    text,
-    created_at: new Date().toISOString(),
+    source: 'Prompt',
+    label: 'Prompt',
+    text: turn.user.text,
+    created_at: turn.user.created_at,
   })
   persistCollected(selectedProjectId.value)
 }
@@ -437,8 +485,8 @@ function useSuggestion(s: string) {
   send()
 }
 
-function deleteChatMessage(id: string) {
-  chatHistory.value = chatHistory.value.filter((m) => m.id !== id)
+function deleteChatTurn(turn: ChatTurn) {
+  chatHistory.value = chatHistory.value.filter((m) => m.id !== turn.user.id && m.id !== turn.assistant?.id)
   persistChatHistory(selectedProjectId.value)
 }
 
@@ -456,12 +504,13 @@ async function generateStandardReport() {
     method: 'POST',
     body: JSON.stringify({
       project_id: selectedProjectId.value,
-      user_prompts: [],
+      user_prompts: DEFAULT_PRESET_PROMPTS,
       chat_history: chatHistory.value,
       annotation_assets: assets,
       author: reportAuthor.value,
     }),
   })
+  consolidatedReport.value = null
 }
 
 async function consolidateCollectedReport() {
@@ -486,6 +535,7 @@ async function consolidateCollectedReport() {
         })),
       }),
     })
+    consolidatedReport.value = reportResult.value
   } catch (e: unknown) {
     const msg =
       e && typeof e === 'object' && 'data' in e
@@ -713,7 +763,7 @@ function exportAnnotatedImage() {
 </script>
 
 <template>
-  <div class="assistant">
+  <div class="assistant" @click="closeDownloadMenu">
     <header class="page-head">
       <h1>AI Assistant</h1>
       <p class="muted lead-intro">
@@ -779,11 +829,10 @@ function exportAnnotatedImage() {
               </ul>
             </div>
           </div>
-        </section>
 
         <section class="prompt-box">
           <button type="button" class="prompt-toggle" @click="showPrompts = !showPrompts">
-            <strong>Preset prompts</strong>
+            <strong>Preset prompts, prompt, and result</strong>
             <span class="toggle-arrow" :aria-label="showPrompts ? 'Collapse preset prompts' : 'Expand preset prompts'">
               <svg
                 v-if="showPrompts"
@@ -814,9 +863,50 @@ function exportAnnotatedImage() {
           <div v-if="showPrompts" class="preset-panel">
             <p class="muted small">Manage your saved prompts — add your own or remove ones you do not need.</p>
             <div class="preset-actions">
-              <button type="button" class="btn btn-outline tiny-btn" @click="resetPresetPrompts">
+              <button type="button" class="btn btn-primary tiny-btn" :disabled="!selectedProjectId" @click="generateStandardReport">
+                Generate Quick Report
+              </button>
+              <button type="button" class="btn btn-ghost tiny-btn" :disabled="!selectedProjectId" @click="clearChatHistory">
+                Clear all chat
+              </button>
+              <button type="button" class="preset-reload-link" @click.stop.prevent="resetPresetPrompts">
                 Reload built-in prompts
               </button>
+            </div>
+            <div v-if="reportResult" class="card report-box report-box-inline">
+              <div class="report-head">
+                <div class="report-title-block">
+                  <div class="report-title-line">
+                    <strong>Report ready</strong>
+                    <span class="report-meta-gap muted small">{{ reportResult.report_type }} · {{ reportResult.report_id }}</span>
+                  </div>
+                </div>
+                <div class="report-head-actions">
+                  <div class="download-menu" @click.stop>
+                    <button
+                      type="button"
+                      class="icon-btn"
+                      aria-label="Download report"
+                      @click.stop="toggleDownloadMenu(`report-${reportResult.report_id}`)"
+                    >
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+                      </svg>
+                    </button>
+                    <div v-if="openDownloadMenuId === `report-${reportResult.report_id}`" class="download-dropdown">
+                      <button
+                        v-for="opt in reportDownloadOptions(reportResult)"
+                        :key="opt.key"
+                        type="button"
+                        class="download-option"
+                        @click.stop="opt.onSelect(); closeDownloadMenu()"
+                      >
+                        {{ opt.label }}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
             <div class="preset-list">
               <div v-for="(s, i) in presetPrompts" :key="i + s.slice(0, 12)" class="preset-row">
@@ -838,38 +928,78 @@ function exportAnnotatedImage() {
         </section>
 
         <div v-if="chatHistory.length || loading" class="output">
-          <div v-if="loading" class="muted">Thinking…</div>
-          <div v-else class="chat-list">
-            <article v-for="item in chatHistory" :key="item.id" class="chat-item" :class="item.role">
+          <div class="chat-list">
+            <article
+              v-for="(turn, idx) in chatTurns"
+              :key="`${turn.user.id}-${idx}`"
+              class="chat-item chat-turn"
+            >
               <div class="chat-toolbar">
                 <div class="chat-role">
-                  {{ item.role === 'user' ? 'You' : 'AI Assistant' }} · {{ new Date(item.created_at).toLocaleString() }}
+                  Sent {{ new Date(turn.user.created_at).toLocaleString()
+                  }}<template v-if="turn.assistant">
+                    · replied {{ new Date(turn.assistant.created_at).toLocaleString() }}</template>
                 </div>
                 <div class="chat-actions">
-                  <div class="download-menu" title="Download">
-                    <button type="button" class="icon-btn" aria-label="Download as text" @click="downloadChatExport(item, 'txt')">
+                  <div class="download-menu" title="Download" @click.stop>
+                    <button
+                      type="button"
+                      class="icon-btn"
+                      aria-label="Download exchange"
+                      @click.stop="toggleDownloadMenu(`chat-turn-${turn.user.id}`)"
+                    >
                       <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
                     </button>
-                    <button type="button" class="icon-btn" aria-label="Download as Markdown" @click="downloadChatExport(item, 'md')">
-                      <span class="fmt-label">MD</span>
-                    </button>
-                    <button type="button" class="icon-btn" aria-label="Download as HTML" @click="downloadChatExport(item, 'html')">
-                      <span class="fmt-label">HTML</span>
-                    </button>
+                    <div v-if="openDownloadMenuId === `chat-turn-${turn.user.id}`" class="download-dropdown">
+                      <button
+                        v-for="opt in chatTurnDownloadOptions(turn)"
+                        :key="opt.key"
+                        type="button"
+                        class="download-option"
+                        @click.stop="opt.onSelect(); closeDownloadMenu()"
+                      >
+                        {{ opt.label }}
+                      </button>
+                    </div>
                   </div>
-                  <button type="button" class="icon-btn collect" title="Collect for consolidated report" @click="collectChatMessage(item)">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z" />
+                  <button type="button" class="icon-btn collect" title="Add to customized report" @click="collectChatTurn(turn)">
+                    <svg
+                      class="collect-file-icon"
+                      width="18"
+                      height="18"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <polyline points="14 2 14 8 20 8" />
+                      <line x1="12" y1="18" x2="12" y2="12" />
+                      <line x1="9" y1="15" x2="15" y2="15" />
                     </svg>
                   </button>
-                  <button type="button" class="icon-btn danger" title="Delete message" @click="deleteChatMessage(item.id)">
+                  <button type="button" class="icon-btn danger" title="Delete this exchange" @click="deleteChatTurn(turn)">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                       <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
                     </svg>
                   </button>
                 </div>
               </div>
-              <div class="reply" v-html="renderChatHtml(item)" />
+              <div class="turn-body">
+                <div class="turn-section">
+                  <div class="turn-label">Your message</div>
+                  <div class="turn-content" v-html="renderChatHtml(turn.user)" />
+                </div>
+                <div class="turn-section">
+                  <div class="turn-label">AI Assistant</div>
+                  <div v-if="turn.assistant" class="turn-content reply" v-html="renderChatHtml(turn.assistant)" />
+                  <div v-else-if="loading && idx === chatTurns.length - 1" class="muted small think-hint">Thinking…</div>
+                  <div v-else class="muted small">No reply recorded.</div>
+                </div>
+              </div>
             </article>
           </div>
         </div>
@@ -893,51 +1023,16 @@ function exportAnnotatedImage() {
             Send
           </button>
         </div>
-        <div class="report-actions">
-          <button type="button" class="btn btn-primary" :disabled="!selectedProjectId" @click="generateStandardReport">
-            Generate Standard Report
-          </button>
-          <span v-if="annotationAssets.length" class="muted tiny attached-note">
-            {{ annotationAssets.length }} annotated drawing(s) attached
-          </span>
-          <button type="button" class="btn btn-ghost" :disabled="!selectedProjectId" @click="clearChatHistory">
-            Clear all chat
-          </button>
+        <div v-if="annotationAssets.length" class="report-actions">
+          <span class="muted tiny attached-note">{{ annotationAssets.length }} annotated drawing(s) attached</span>
         </div>
-        <div v-if="reportResult" class="card report-box">
-          <div class="report-head">
-            <div>
-              <strong>Report ready</strong>
-              <span class="muted small">{{ reportResult.report_type }} · {{ reportResult.report_id }}</span>
-            </div>
-            <button type="button" class="icon-btn collect" title="Collect this report" @click="collectCurrentReport">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z" />
-              </svg>
-            </button>
-          </div>
-          <div class="download-links">
-            <button
-              v-for="(path, key) in reportResult.downloads"
-              :key="key"
-              type="button"
-              class="dl-icon-btn"
-              :title="`Download ${key}`"
-              @click="downloadReport(path, key)"
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
-              </svg>
-              <span class="dl-key">{{ key }}</span>
-            </button>
-          </div>
-        </div>
+      </section>
       </div>
 
       <aside class="panel card side-panel">
-        <h2 class="section-label">Collected outputs</h2>
+        <h2 class="section-label">Customized report</h2>
         <p class="muted small">
-          Use the list icon on a message or report to add material here, then build one consolidated report with exports
+          Use the list icon on a message to add prompt material here, then build one customized merged report with exports
           (PDF, Word, HTML, etc.).
         </p>
         <ul class="collected-list">
@@ -961,8 +1056,34 @@ function exportAnnotatedImage() {
           :disabled="!selectedProjectId || !collectedOutputs.length || consolidating"
           @click="consolidateCollectedReport"
         >
-          {{ consolidating ? 'Building…' : 'Consolidate report' }}
+          {{ consolidating ? 'Building…' : 'Generate customized report' }}
         </button>
+        <div v-if="collectedOutputs.length && consolidatedReport" class="collected-download">
+          <div class="download-menu" @click.stop>
+            <button
+              type="button"
+              class="icon-btn"
+              aria-label="Download customized report"
+              @click.stop="toggleDownloadMenu(`consolidated-${consolidatedReport.report_id}`)"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+              </svg>
+            </button>
+            <div v-if="openDownloadMenuId === `consolidated-${consolidatedReport.report_id}`" class="download-dropdown">
+              <button
+                v-for="opt in reportDownloadOptions(consolidatedReport)"
+                :key="opt.key"
+                type="button"
+                class="download-option"
+                @click.stop="opt.onSelect(); closeDownloadMenu()"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
+          </div>
+          <span class="muted tiny">Customized report ready</span>
+        </div>
       </aside>
     </div>
 
@@ -1166,6 +1287,27 @@ function exportAnnotatedImage() {
 
 .preset-actions {
   margin: 0.5rem 0 0.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.preset-reload-link {
+  border: none;
+  background: transparent;
+  padding: 0.35rem 0;
+  margin: 0;
+  font: inherit;
+  font-size: 0.8125rem;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.preset-reload-link:hover {
+  color: var(--text);
 }
 
 .preset-list {
@@ -1232,8 +1374,48 @@ function exportAnnotatedImage() {
   background: var(--main-bg);
   position: relative;
 }
-.chat-item.user {
+
+.chat-turn {
   border-color: var(--accent);
+}
+
+.turn-body {
+  margin-top: 0.25rem;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--main-bg);
+}
+
+.turn-section {
+  padding: 0.55rem 0.65rem;
+}
+
+.turn-section + .turn-section {
+  border-top: 1px solid var(--border);
+}
+
+.turn-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.turn-content {
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.think-hint {
+  margin: 0;
+  padding: 0.15rem 0;
+}
+
+.collect-file-icon {
+  display: block;
 }
 
 .chat-toolbar {
@@ -1257,12 +1439,45 @@ function exportAnnotatedImage() {
 }
 
 .download-menu {
-  display: flex;
+  position: relative;
+  display: inline-flex;
   align-items: center;
-  gap: 0.1rem;
+}
+
+.chat-actions .download-menu {
   padding-right: 0.25rem;
   border-right: 1px solid var(--border);
   margin-right: 0.15rem;
+}
+
+.download-dropdown {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  right: 0;
+  min-width: 130px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--main-bg);
+  box-shadow: 0 10px 24px rgba(2, 6, 23, 0.16);
+  overflow: hidden;
+  z-index: 5;
+}
+
+.download-option {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.45rem 0.6rem;
+  cursor: pointer;
+}
+
+.download-option:hover {
+  background: var(--accent-dim);
 }
 
 .icon-btn {
@@ -1290,11 +1505,6 @@ function exportAnnotatedImage() {
 
 .icon-btn.collect:hover {
   color: var(--accent);
-}
-
-.fmt-label {
-  font-size: 0.65rem;
-  font-weight: 700;
 }
 
 .reply {
@@ -1381,39 +1591,27 @@ function exportAnnotatedImage() {
 .report-head {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  gap: 0.5rem;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
 }
 
-.download-links {
+.report-title-line {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  align-items: baseline;
+  gap: 0.5rem 0.75rem;
 }
 
-.dl-icon-btn {
+.report-meta-gap {
+  display: inline-block;
+}
+
+.report-head-actions {
   display: inline-flex;
-  flex-direction: column;
   align-items: center;
-  gap: 0.2rem;
-  padding: 0.45rem 0.55rem;
-  min-width: 56px;
-  border: 1px solid var(--border);
-  border-radius: 0.5rem;
-  background: var(--main-bg);
-  color: var(--text);
-  cursor: pointer;
-  font-size: 0.65rem;
-  text-transform: uppercase;
-}
-
-.dl-icon-btn:hover {
-  border-color: var(--accent);
-  background: var(--accent-dim);
-}
-
-.dl-key {
-  font-weight: 600;
+  gap: 0.15rem;
+  flex-shrink: 0;
 }
 
 .area {
@@ -1466,6 +1664,13 @@ function exportAnnotatedImage() {
 .block-btn {
   width: 100%;
   margin-top: 0.5rem;
+}
+
+.collected-download {
+  margin-top: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
 }
 
 .modal-backdrop {

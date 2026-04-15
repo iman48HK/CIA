@@ -29,6 +29,10 @@ class OrdinanceFolderRename(BaseModel):
     name: str = Field(min_length=1, max_length=255)
 
 
+class OrdinanceFileRename(BaseModel):
+    title: str = Field(min_length=1, max_length=512)
+
+
 @router.get("/folders", response_model=list[OrdinanceFolderOut])
 def list_folders(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     folders = db.query(OrdinanceFolder).order_by(OrdinanceFolder.id).all()
@@ -212,6 +216,34 @@ def delete_ordinance_file(
     db.delete(row)
     db.commit()
     return {"ok": True}
+
+
+@router.patch("/files/{file_id}", response_model=OrdinanceFileOut)
+def rename_ordinance_file(
+    file_id: int,
+    body: OrdinanceFileRename,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    row = db.query(OrdinanceFile).filter(OrdinanceFile.id == file_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Ordinance file not found")
+    row.title = body.title.strip()
+    db.commit()
+    db.refresh(row)
+    meta = (
+        db.query(OrdinanceFileUploadMeta)
+        .filter(OrdinanceFileUploadMeta.ordinance_file_id == file_id)
+        .first()
+    )
+    return OrdinanceFileOut(
+        id=row.id,
+        folder_id=row.folder_id,
+        title=row.title,
+        created_at=row.created_at,
+        content_type=meta.content_type if meta else None,
+        size_bytes=meta.size_bytes if meta else None,
+    )
 
 
 @router.get("/files/{file_id}/content")

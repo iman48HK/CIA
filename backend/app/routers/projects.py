@@ -23,6 +23,7 @@ from app.schemas import (
     OrdinanceSelectionRefOut,
     ProjectAnalysisFilesOut,
     ProjectCreate,
+    ProjectUpdate,
     ProjectFolderCreate,
     ProjectFolderOut,
     ProjectOrdinanceSelectionCreate,
@@ -118,6 +119,25 @@ def get_project(
     project_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     return _enrich_project(db, _project(db, project_id, user))
+
+
+@router.put("/by-id/{project_id}", response_model=ProjectOut)
+def update_project(
+    project_id: int,
+    body: ProjectUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    p = _project(db, project_id, user)
+    folder = _workspace_folder(db, body.workspace_folder_id, user)
+    link = db.query(ProjectWorkspaceLink).filter(ProjectWorkspaceLink.project_id == p.id).first()
+    if link:
+        link.workspace_folder_id = folder.id
+    else:
+        db.add(ProjectWorkspaceLink(project_id=p.id, workspace_folder_id=folder.id))
+    db.commit()
+    db.refresh(p)
+    return _enrich_project(db, p)
 
 
 @router.get("/by-id/{project_id}/folders", response_model=list[ProjectFolderOut])
