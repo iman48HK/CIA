@@ -33,6 +33,7 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 REPORTS_DIR = Path(__file__).resolve().parents[2] / "storage" / "reports"
+REPORT_BRAND_HEADER = "Construction Insight Agent"
 
 
 class ProjectAIChatRequest(AIChatRequest):
@@ -613,13 +614,14 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>{escape(report_title)} — {escape(report_id)}</title>
+  <title>{escape(REPORT_BRAND_HEADER)} — {escape(report_title)} — {escape(report_id)}</title>
   <style>
     body {{ font-family: "Segoe UI", system-ui, sans-serif; margin: 0; color: #0f172a; background: #f8fafc; line-height: 1.55; }}
     .wrap {{ max-width: 920px; margin: 0 auto; padding: 32px 24px 48px; background: #fff; min-height: 100vh;
       box-shadow: 0 1px 3px rgba(15,23,42,0.08); }}
     .report-header {{ border-bottom: 2px solid #10b981; padding-bottom: 20px; margin-bottom: 28px; }}
-    .report-header h1 {{ margin: 0 0 10px; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }}
+    .report-header h1 {{ margin: 0 0 4px; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }}
+    .report-subhead {{ margin: 0 0 10px; font-size: 1.05rem; font-weight: 600; color: #334155; }}
     .meta {{ color: #64748b; font-size: 0.9rem; display: flex; flex-wrap: wrap; gap: 12px 24px; }}
     .meta strong {{ color: #334155; }}
     .section-title {{ font-size: 1.2rem; margin: 0 0 12px; color: #0f172a; border-left: 4px solid #10b981; padding-left: 10px; }}
@@ -666,7 +668,8 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
 <body>
   <div class="wrap">
     <header class="report-header">
-      <h1>{escape(report_title)}</h1>
+      <h1>{escape(REPORT_BRAND_HEADER)}</h1>
+      <p class="report-subhead">{escape(report_title)}</p>
       <div class="meta">
         <span><strong>Report ID</strong> {escape(report_id)}</span>
         <span><strong>Project</strong> {escape(project_name)}</span>
@@ -838,7 +841,8 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
         bottomMargin=52,
     )
     story: list = []
-    story.append(Paragraph(escape(report_title), title_style))
+    story.append(Paragraph(escape(REPORT_BRAND_HEADER), title_style))
+    story.append(Paragraph(escape(report_title), h2_style))
     story.append(
         Paragraph(
             f"<b>Report ID:</b> {escape(report_id)} &nbsp;|&nbsp; "
@@ -953,10 +957,14 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
 
     docx_doc = Document()
     t_para = docx_doc.add_paragraph()
-    t_run = t_para.add_run(report_title)
+    t_run = t_para.add_run(REPORT_BRAND_HEADER)
     t_run.bold = True
     t_run.font.size = Pt(22)
     t_para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+    sub_para = docx_doc.add_paragraph()
+    sub_run = sub_para.add_run(report_title)
+    sub_run.bold = True
+    sub_run.font.size = Pt(14)
 
     meta = docx_doc.add_paragraph()
     meta.add_run("Report ID: ").bold = True

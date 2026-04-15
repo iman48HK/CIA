@@ -874,41 +874,6 @@ function exportAnnotatedImage() {
                 Reload built-in prompts
               </button>
             </div>
-            <div v-if="reportResult" class="card report-box report-box-inline">
-              <div class="report-head">
-                <div class="report-title-block">
-                  <div class="report-title-line">
-                    <strong>Report ready</strong>
-                    <span class="report-meta-gap muted small">{{ reportResult.report_type }} · {{ reportResult.report_id }}</span>
-                  </div>
-                </div>
-                <div class="report-head-actions">
-                  <div class="download-menu" @click.stop>
-                    <button
-                      type="button"
-                      class="icon-btn"
-                      aria-label="Download report"
-                      @click.stop="toggleDownloadMenu(`report-${reportResult.report_id}`)"
-                    >
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                        <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
-                      </svg>
-                    </button>
-                    <div v-if="openDownloadMenuId === `report-${reportResult.report_id}`" class="download-dropdown">
-                      <button
-                        v-for="opt in reportDownloadOptions(reportResult)"
-                        :key="opt.key"
-                        type="button"
-                        class="download-option"
-                        @click.stop="opt.onSelect(); closeDownloadMenu()"
-                      >
-                        {{ opt.label }}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
             <div class="preset-list">
               <div v-for="(s, i) in presetPrompts" :key="i + s.slice(0, 12)" class="preset-row">
                 <button type="button" class="suggestion" @click="useSuggestion(s)">{{ s }}</button>
@@ -927,6 +892,41 @@ function exportAnnotatedImage() {
             </div>
           </div>
         </section>
+        <div v-if="reportResult" class="card report-box report-box-inline">
+          <div class="report-head">
+            <div class="report-title-block">
+              <div class="report-title-line">
+                <strong>Report ready</strong>
+                <span class="report-meta-gap muted small">{{ reportResult.report_type }} · {{ reportResult.report_id }}</span>
+              </div>
+            </div>
+            <div class="report-head-actions">
+              <div class="download-menu" @click.stop>
+                <button
+                  type="button"
+                  class="icon-btn"
+                  aria-label="Download report"
+                  @click.stop="toggleDownloadMenu(`report-${reportResult.report_id}`)"
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+                  </svg>
+                </button>
+                <div v-if="openDownloadMenuId === `report-${reportResult.report_id}`" class="download-dropdown">
+                  <button
+                    v-for="opt in reportDownloadOptions(reportResult)"
+                    :key="opt.key"
+                    type="button"
+                    class="download-option"
+                    @click.stop="opt.onSelect(); closeDownloadMenu()"
+                  >
+                    {{ opt.label }}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
 
         <div v-if="chatHistory.length || loading" class="output">
           <div class="chat-list">
@@ -1059,17 +1059,15 @@ function exportAnnotatedImage() {
         >
           {{ consolidating ? 'Building…' : 'Generate customized report' }}
         </button>
-        <div v-if="collectedOutputs.length && consolidatedReport" class="collected-download">
+        <div v-if="consolidatedReport" class="collected-download">
           <div class="download-menu" @click.stop>
             <button
               type="button"
-              class="icon-btn"
+              class="btn btn-outline btn-sm"
               aria-label="Download customized report"
               @click.stop="toggleDownloadMenu(`consolidated-${consolidatedReport.report_id}`)"
             >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
-              </svg>
+              Download customized report
             </button>
             <div v-if="openDownloadMenuId === `consolidated-${consolidatedReport.report_id}`" class="download-dropdown">
               <button
