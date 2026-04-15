@@ -3,6 +3,7 @@ import json
 import csv
 import base64
 import binascii
+import re
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -71,6 +72,7 @@ class CollectedMaterialIn(BaseModel):
 class ConsolidateCollectionReportRequest(BaseModel):
     project_id: int
     items: list[CollectedMaterialIn] = Field(default_factory=list, min_length=1, max_length=80)
+    chat_history: list[dict] = Field(default_factory=list, max_length=500)
     annotation_assets: list[AnnotationAssetIn] = Field(default_factory=list, max_length=30)
     author: str | None = Field(default=None, max_length=200)
 
@@ -222,6 +224,71 @@ def _assistant_reply_after_user_message(chat_history: list[dict], user_text: str
             if role == "user":
                 break
     return "No assistant reply appears after this message in the exported transcript."
+
+
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
+
+
+def _parse_markdown_sections(markdown_text: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
+    current = "General"
+    sections[current] = []
+    for raw_line in str(markdown_text or "").splitlines():
+        m = _HEADING_RE.match(raw_line)
+        if m:
+            current = m.group(1).strip()
+            sections.setdefault(current, [])
+            continue
+        sections[current].append(raw_line)
+    return {k: "\n".join(v).strip() for k, v in sections.items() if "\n".join(v).strip()}
+
+
+def _normalize_section_name(name: str) -> str:
+    n = name.strip().lower()
+    n = re.sub(r"[^a-z0-9\s/]", "", n)
+    n = re.sub(r"\s+", " ", n)
+    return n
+
+
+def _merged_sections_from_collected_prompts(items: list[CollectedMaterialIn], chat_history: list[dict]) -> dict[str, str]:
+    core_map = {
+        "quick summary": "Quick Summary",
+        "key findings": "Key Findings",
+        "recommended actions": "Recommended Actions",
+        "references / citations": "References / Citations",
+        "references citations": "References / Citations",
+    }
+    core_sections: dict[str, list[str]] = {v: [] for v in core_map.values()}
+    extra_sections: dict[str, list[str]] = {}
+    prompt_specific: dict[str, str] = {}
+
+    selected_prompts = [i.text.strip() for i in items if i.text.strip()]
+    for idx, prompt in enumerate(selected_prompts, start=1):
+        reply = _assistant_reply_after_user_message(chat_history, prompt)
+        prompt_specific[f"Prompt {idx}"] = (
+            f"User message:\n{prompt}\n\nAssistant reply:\n{reply}"
+        )
+        parsed = _parse_markdown_sections(reply)
+        for heading, body in parsed.items():
+            norm = _normalize_section_name(heading)
+            target = core_map.get(norm)
+            if target:
+                core_sections[target].append(body)
+            else:
+                extra_sections.setdefault(heading.strip(), []).append(body)
+
+    merged: dict[str, str] = {}
+    for k in ("Quick Summary", "Key Findings", "Recommended Actions", "References / Citations"):
+        joined = "\n\n".join([s for s in core_sections.get(k, []) if s.strip()]).strip()
+        if joined:
+            merged[k] = joined
+
+    for heading, chunks in extra_sections.items():
+        joined = "\n\n".join([s for s in chunks if s.strip()]).strip()
+        if joined:
+            merged[f"Additional: {heading}"] = joined
+
+    return {**merged, **prompt_specific}
 
 
 def _reference_generated_sections() -> dict:
@@ -1038,6 +1105,7 @@ def generate_consolidate_collection_report(
         chat_history=transcript,
         annotation_assets=[a.model_dump() for a in body.annotation_assets],
     )
+    merged_sections = _merged_sections_from_collected_prompts(body.items, body.chat_history)
     collected_gs: dict[str, str] = {}
     for idx, item in enumerate(body.items, start=1):
         label = (item.label or f"Output {idx}").strip()
@@ -1046,7 +1114,7 @@ def generate_consolidate_collection_report(
         collected_gs[f"Collected {idx}: {label}"] = (
             f"Source: {item.source}\nID: {item.id or '—'}\nCreated: {item.created_at or '—'}\n\n{item.text}"
         )
-    payload["generated_sections"] = {**collected_gs, **payload["generated_sections"]}
+    payload["generated_sections"] = {**merged_sections, **collected_gs, **payload["generated_sections"]}
     payload["collected_materials"] = [m.model_dump() for m in body.items]
     _apply_report_metadata(payload, project, "Consolidated Report (Collected Outputs)", body.author)
     files = _write_report_files(report_id, payload)

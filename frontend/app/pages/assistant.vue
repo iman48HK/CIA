@@ -525,6 +525,7 @@ async function consolidateCollectedReport() {
       body: JSON.stringify({
         project_id: selectedProjectId.value,
         author: reportAuthor.value,
+        chat_history: chatHistory.value,
         annotation_assets: assets,
         items: collectedOutputs.value.map((c) => ({
           id: c.id,
