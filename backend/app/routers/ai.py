@@ -111,6 +111,110 @@ async def _request_openrouter(model: str, message: str, headers: dict[str, str])
         return await client.post(OPENROUTER_URL, json=payload, headers=headers)
 
 
+def _request_openrouter_sync(model: str, message: str, headers: dict[str, str]) -> httpx.Response:
+    system = (
+        "You are AI Assistant for construction projects. "
+        "Return responses in clean Markdown with this structure:\n"
+        "## Quick Summary\n"
+        "- 2-4 concise bullets\n\n"
+        "## Key Findings\n"
+        "- Ordered by impact\n\n"
+        "## Recommended Actions\n"
+        "- Actionable next steps\n\n"
+        "## References / Citations\n"
+        "- Cite standards, ordinance docs, or assumptions used\n\n"
+        "## Confidence\n"
+        "- confidence_score: <0-100>\n"
+        "- doubt_score: <0-100>\n"
+        "- manual_review_reason: <why review is needed or 'None'>\n\n"
+        "Rules:\n"
+        "- Be concise and practical.\n"
+        "- If data is missing, explicitly state assumptions.\n"
+        "- Never invent citations; if unavailable, say so.\n"
+        "- Use clear headings and bullet points only (no long paragraphs)."
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": message},
+        ],
+    }
+    with httpx.Client(timeout=120.0) as client:
+        return client.post(OPENROUTER_URL, json=payload, headers=headers)
+
+
+def _project_context_message(project: Project, db: Session) -> str:
+    drawing_rows = (
+        db.query(ProjectDrawingUpload)
+        .filter(ProjectDrawingUpload.project_id == project.id)
+        .order_by(ProjectDrawingUpload.id.desc())
+        .all()
+    )
+    selected_ordinance_ids = [
+        oid
+        for (oid,) in db.query(ProjectOrdinanceSelection.ordinance_file_id)
+        .filter(ProjectOrdinanceSelection.project_id == project.id)
+        .all()
+    ]
+    ordinance_titles = [
+        title
+        for (title,) in db.query(OrdinanceFile.title)
+        .filter(OrdinanceFile.id.in_(selected_ordinance_ids))
+        .all()
+    ] if selected_ordinance_ids else []
+    project_file_names = [
+        fname
+        for (fname,) in db.query(ProjectFileUpload.filename)
+        .filter(ProjectFileUpload.project_id == project.id)
+        .order_by(ProjectFileUpload.id.desc())
+        .all()
+    ]
+    return (
+        f"[Project: {project.name} | Project ID: {project.id}]\n"
+        f"[Drawings: {', '.join([d.filename for d in drawing_rows]) if drawing_rows else 'None'}]\n"
+        f"[Selected Ordinance Docs: {', '.join(ordinance_titles) if ordinance_titles else 'None'}]\n"
+        f"[Optional Project Files: {', '.join(project_file_names) if project_file_names else 'None'}]\n"
+    )
+
+
+def _run_selected_prompts(
+    prompts: list[str],
+    project: Project,
+    db: Session,
+) -> list[dict]:
+    clean_prompts = [p.strip() for p in prompts if isinstance(p, str) and p.strip()]
+    if not clean_prompts:
+        return []
+    if not settings.openrouter_api_key:
+        return []
+    headers = {
+        "Authorization": f"Bearer {settings.openrouter_api_key}",
+        "HTTP-Referer": "http://localhost:3000",
+        "X-Title": "Construction Insight Agent",
+        "Content-Type": "application/json",
+    }
+    prefix = _project_context_message(project, db)
+    transcript: list[dict] = []
+    for prompt in clean_prompts:
+        scoped = f"{prefix}{prompt}"
+        try:
+            r = _request_openrouter_sync(settings.openrouter_model, scoped, headers)
+            if r.status_code != 200 and settings.openrouter_fallback_model:
+                r = _request_openrouter_sync(settings.openrouter_fallback_model, scoped, headers)
+            if r.status_code != 200:
+                reply = f"Unable to generate AI response for this prompt. ({r.status_code})"
+            else:
+                data = r.json()
+                reply = str(data["choices"][0]["message"]["content"] or "")
+        except Exception:
+            reply = "Unable to generate AI response for this prompt."
+        now = datetime.now(timezone.utc).isoformat()
+        transcript.append({"role": "user", "text": prompt, "created_at": now})
+        transcript.append({"role": "assistant", "text": reply, "created_at": now})
+    return transcript
+
+
 @router.post("/chat", response_model=AIChatResponse)
 async def chat(
     body: ProjectAIChatRequest,
@@ -1049,17 +1153,19 @@ def generate_standard_report(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     report_id = f"standard-{body.project_id}-{uuid4().hex[:8]}"
-    derived_prompts: list[str] = []
-    for row in body.chat_history:
-        if str(row.get("role", "")).lower() != "user":
-            continue
-        text = str(row.get("text", "")).strip()
-        if text:
-            derived_prompts.append(text)
+    selected_prompts = [p.strip() for p in body.user_prompts if isinstance(p, str) and p.strip()]
+    if not selected_prompts:
+        for row in body.chat_history:
+            if str(row.get("role", "")).lower() != "user":
+                continue
+            text = str(row.get("text", "")).strip()
+            if text:
+                selected_prompts.append(text)
+    generated_transcript = _run_selected_prompts(selected_prompts, project, db)
     payload = _report_payload(
         body.project_id,
-        prompts=derived_prompts,
-        chat_history=body.chat_history,
+        prompts=selected_prompts,
+        chat_history=generated_transcript or body.chat_history,
         annotation_assets=body.annotation_assets,
     )
     _apply_report_metadata(payload, project, "Standard AI Assistant Report", body.author)
@@ -1098,22 +1204,26 @@ def generate_consolidate_collection_report(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     report_id = f"consolidated-collection-{body.project_id}-{uuid4().hex[:8]}"
-    transcript: list[dict] = []
-    for item in body.items:
-        header = f"### {item.label}\n_Source: {item.source}_ · _ID: {item.id or '—'}_\n\n"
-        transcript.append(
-            {
-                "role": "assistant",
-                "text": header + item.text,
-                "created_at": item.created_at or "",
-            }
-        )
+    selected_prompts = [item.text.strip() for item in body.items if item.text.strip()]
+    generated_transcript = _run_selected_prompts(selected_prompts, project, db)
+    transcript = generated_transcript
+    if not transcript:
+        transcript = []
+        for item in body.items:
+            header = f"### {item.label}\n_Source: {item.source}_ · _ID: {item.id or '—'}_\n\n"
+            transcript.append(
+                {
+                    "role": "assistant",
+                    "text": header + item.text,
+                    "created_at": item.created_at or "",
+                }
+            )
     payload = _report_payload(
         body.project_id,
         chat_history=transcript,
         annotation_assets=[a.model_dump() for a in body.annotation_assets],
     )
-    merged_sections = _merged_sections_from_collected_prompts(body.items, body.chat_history)
+    merged_sections = _merged_sections_from_collected_prompts(body.items, generated_transcript or body.chat_history)
     collected_gs: dict[str, str] = {}
     for idx, item in enumerate(body.items, start=1):
         label = (item.label or f"Output {idx}").strip()
