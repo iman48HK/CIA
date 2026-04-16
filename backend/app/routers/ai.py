@@ -5,6 +5,7 @@ import base64
 import binascii
 import re
 from datetime import datetime, timezone
+from typing import Literal
 from html import escape
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
@@ -57,6 +58,7 @@ class AnnotationMarkerIn(BaseModel):
 
 class AnnotationAssetIn(BaseModel):
     drawing_id: int
+    source_kind: Literal["drawing", "project_file"] = "drawing"
     filename: str = Field(min_length=1, max_length=255)
     image_data_url: str = Field(min_length=1, max_length=6_000_000)
     markers: list[AnnotationMarkerIn] = Field(default_factory=list, max_length=500)
@@ -75,6 +77,7 @@ class ConsolidateCollectionReportRequest(BaseModel):
     items: list[CollectedMaterialIn] = Field(default_factory=list, min_length=1, max_length=80)
     chat_history: list[dict] = Field(default_factory=list, max_length=500)
     annotation_assets: list[AnnotationAssetIn] = Field(default_factory=list, max_length=30)
+    include_annotated_drawing: bool = False
     author: str | None = Field(default=None, max_length=200)
 
 
@@ -624,6 +627,13 @@ def _html_attached_annotations(payload: dict) -> str:
     assets = payload.get("annotated_drawing_assets") or []
     if not assets:
         return ""
+    title = escape(str(payload.get("attached_annotations_section_title") or "Attached annotated drawings"))
+    lead = escape(
+        str(
+            payload.get("attached_annotations_section_lead")
+            or "User-attached drawing overlays included with this report export."
+        )
+    )
     cards: list[str] = []
     for i, row in enumerate(assets, start=1):
         filename = escape(str(row.get("filename", f"Drawing {i}")))
@@ -644,8 +654,8 @@ def _html_attached_annotations(payload: dict) -> str:
         )
     return f"""
     <section class="block">
-      <h2 class="section-title">Attached annotated drawings</h2>
-      <p class="lead">User-attached drawing overlays included with this report export.</p>
+      <h2 class="section-title">{title}</h2>
+      <p class="lead">{lead}</p>
       <div class="annotated-grid">{''.join(cards)}</div>
     </section>
     """
@@ -670,8 +680,8 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
     pdf_path = REPORTS_DIR / f"{report_id}.pdf"
     docx_path = REPORTS_DIR / f"{report_id}.docx"
     html_path = REPORTS_DIR / f"{report_id}.html"
-    json_text = json.dumps(payload, indent=2)
-    json_path.write_text(json_text, encoding="utf-8")
+    # Layout hints for HTML export only (omit from stored JSON).
+    attached_annotations_last = bool(payload.pop("attached_annotations_last", False))
 
     report_title = str(payload.get("report_title") or "AI Assistant Report")
     author = str(payload.get("author") or "—")
@@ -713,6 +723,18 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
     sections_html = _html_generated_sections_table(section_rows)
     ann_html = _html_annotation_table(payload)
     attached_ann_html = _html_attached_annotations(payload)
+
+    transcript_inner = (
+        "".join(chat_blocks_html) if chat_blocks_html else '<p class="muted">No transcript included.</p>'
+    )
+    transcript_section = f"""    <section class="block transcript">
+      <h2 class="section-title">Transcript &amp; narrative</h2>
+      {transcript_inner}
+    </section>"""
+    if attached_annotations_last and attached_ann_html.strip():
+        tail_sections = f"{ann_html}\n{transcript_section}\n{attached_ann_html}"
+    else:
+        tail_sections = f"{ann_html}\n{attached_ann_html}\n{transcript_section}"
 
     report_html = f"""<!doctype html>
 <html lang="en">
@@ -783,12 +805,7 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
     </header>
     {chart_html}
     {sections_html}
-    {ann_html}
-    {attached_ann_html}
-    <section class="block transcript">
-      <h2 class="section-title">Transcript &amp; narrative</h2>
-      {''.join(chat_blocks_html) if chat_blocks_html else '<p class="muted">No transcript included.</p>'}
-    </section>
+{tail_sections}
     <p class="footnote">CIA Construction Insight Agent — exported document. Tables and charts are illustrative where sample data is used.</p>
   </div>
 </body>
@@ -1115,22 +1132,35 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
         p.add_run(f"{row.get('annotation_type', '')} — {row.get('drawing_sheet', '')}: ").bold = True
         p.add_run(str(row.get("description", "")))
 
-    docx_doc.add_heading("Attached annotated drawings", level=2)
-    if annotated_assets:
-        for i, asset in enumerate(annotated_assets, start=1):
-            p = docx_doc.add_paragraph(style="List Bullet")
-            p.add_run(f"{asset.get('filename', f'Drawing {i}')} ").bold = True
-            p.add_run(f"({len(asset.get('markers') or [])} marker(s), download key: annotated_png_{i})")
-    else:
-        docx_doc.add_paragraph("No annotated drawings attached.")
+    attach_heading = str(payload.get("attached_annotations_section_title") or "Attached annotated drawings")
 
-    docx_doc.add_heading("Transcript", level=2)
-    for row in chat_rows:
-        p = docx_doc.add_paragraph()
-        p.add_run(f"[{str(row.get('role', 'assistant')).upper()}] ").bold = True
-        p.add_run(str(row.get("created_at", "")))
-        docx_doc.add_paragraph(str(row.get("text", "")))
+    def _docx_transcript_block() -> None:
+        docx_doc.add_heading("Transcript", level=2)
+        for row in chat_rows:
+            p = docx_doc.add_paragraph()
+            p.add_run(f"[{str(row.get('role', 'assistant')).upper()}] ").bold = True
+            p.add_run(str(row.get("created_at", "")))
+            docx_doc.add_paragraph(str(row.get("text", "")))
+
+    def _docx_attached_list_block() -> None:
+        docx_doc.add_heading(attach_heading, level=2)
+        if annotated_assets:
+            for i, asset in enumerate(annotated_assets, start=1):
+                p = docx_doc.add_paragraph(style="List Bullet")
+                p.add_run(f"{asset.get('filename', f'Drawing {i}')} ").bold = True
+                p.add_run(f"({len(asset.get('markers') or [])} marker(s), download key: annotated_png_{i})")
+        else:
+            docx_doc.add_paragraph("No annotated drawings attached.")
+
+    if attached_annotations_last and annotated_assets:
+        _docx_transcript_block()
+        _docx_attached_list_block()
+    else:
+        _docx_attached_list_block()
+        _docx_transcript_block()
     docx_doc.save(docx_path)
+
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     return {
         "json": f"/api/ai/reports/download/{json_path.name}",
@@ -1218,10 +1248,13 @@ def generate_consolidate_collection_report(
                     "created_at": item.created_at or "",
                 }
             )
+    ann_payload = (
+        [a.model_dump() for a in body.annotation_assets] if body.include_annotated_drawing else []
+    )
     payload = _report_payload(
         body.project_id,
         chat_history=transcript,
-        annotation_assets=[a.model_dump() for a in body.annotation_assets],
+        annotation_assets=ann_payload,
     )
     merged_sections = _merged_sections_from_collected_prompts(body.items, generated_transcript or body.chat_history)
     collected_gs: dict[str, str] = {}
@@ -1234,6 +1267,12 @@ def generate_consolidate_collection_report(
         )
     payload["generated_sections"] = {**merged_sections, **collected_gs, **payload["generated_sections"]}
     payload["collected_materials"] = [m.model_dump() for m in body.items]
+    if body.include_annotated_drawing and ann_payload:
+        payload["attached_annotations_last"] = True
+        payload["attached_annotations_section_title"] = "Annotated drawing — Custom Report"
+        payload["attached_annotations_section_lead"] = (
+            "Annotated image(s) from Drawings or Project files (final section of this Custom Report)."
+        )
     _apply_report_metadata(payload, project, "Consolidated Report (Collected Outputs)", body.author)
     files = _write_report_files(report_id, payload)
     return {"report_type": "consolidated_collection", "report_id": report_id, "payload": payload, "downloads": files}

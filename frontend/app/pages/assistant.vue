@@ -35,6 +35,7 @@ type ReportResult = {
 }
 const reportResult = ref<ReportResult | null>(null)
 const consolidatedReport = ref<ReportResult | null>(null)
+const customReportAnchor = ref<HTMLElement | null>(null)
 const projectReady = ref(false)
 const readinessHint = ref('Choose a project before asking.')
 const showPrompts = ref(true)
@@ -81,6 +82,10 @@ type CollectedItem = {
 }
 const collectedOutputs = ref<CollectedItem[]>([])
 const consolidating = ref(false)
+const includeDrawingInCustomReport = ref(false)
+
+type AnnotatableKind = 'drawing' | 'project_file'
+const annotationSourceKind = ref<AnnotatableKind>('drawing')
 
 const annotationDrawing = ref<UploadRow | null>(null)
 const annotationObjectUrl = ref('')
@@ -88,6 +93,7 @@ const annotationMode = ref<'deficiency' | 'discrepancy'>('deficiency')
 type AnnotationMarker = { xPct: number; yPct: number; type: 'deficiency' | 'discrepancy'; note: string }
 type AnnotationAsset = {
   drawing_id: number
+  source_kind: AnnotatableKind
   filename: string
   image_data_url: string
   markers: AnnotationMarker[]
@@ -109,6 +115,89 @@ function storageKeyPresets(): string {
 
 function storageKeyCollected(projectId: number | null): string | null {
   return projectId ? `cia_collected_outputs_${projectId}` : null
+}
+
+function storageKeyAnnotations(projectId: number | null): string | null {
+  return projectId ? `cia_annotation_assets_${projectId}` : null
+}
+
+function parseAnnotationAssetRow(row: unknown): AnnotationAsset | null {
+  if (!row || typeof row !== 'object') return null
+  const o = row as Record<string, unknown>
+  const drawing_id = Number(o.drawing_id)
+  if (!Number.isFinite(drawing_id)) return null
+  const filename = String(o.filename ?? '').trim()
+  if (!filename) return null
+  const image_data_url = String(o.image_data_url ?? '')
+  if (!image_data_url.startsWith('data:image/')) return null
+  const source_kind: AnnotatableKind = o.source_kind === 'project_file' ? 'project_file' : 'drawing'
+  const markersRaw = o.markers
+  if (!Array.isArray(markersRaw)) return null
+  const markers: AnnotationMarker[] = []
+  for (const m of markersRaw) {
+    if (!m || typeof m !== 'object') continue
+    const mr = m as Record<string, unknown>
+    const xPct = Number(mr.xPct)
+    const yPct = Number(mr.yPct)
+    if (!Number.isFinite(xPct) || !Number.isFinite(yPct)) continue
+    const type = mr.type === 'discrepancy' ? 'discrepancy' : 'deficiency'
+    markers.push({ xPct, yPct, type, note: String(mr.note ?? '') })
+  }
+  return { drawing_id, source_kind, filename, image_data_url, markers }
+}
+
+function loadAnnotationAssets(projectId: number | null) {
+  if (!import.meta.client) return
+  const key = storageKeyAnnotations(projectId)
+  if (!key) {
+    annotationAssets.value = []
+    return
+  }
+  const raw = localStorage.getItem(key)
+  if (!raw) {
+    annotationAssets.value = []
+    return
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown[]
+    if (!Array.isArray(parsed)) {
+      annotationAssets.value = []
+      return
+    }
+    const out: AnnotationAsset[] = []
+    for (const row of parsed) {
+      const a = parseAnnotationAssetRow(row)
+      if (a) out.push(a)
+    }
+    annotationAssets.value = out
+  } catch {
+    annotationAssets.value = []
+  }
+}
+
+function persistAnnotationAssets(projectId: number | null) {
+  if (!import.meta.client) return
+  const key = storageKeyAnnotations(projectId)
+  if (!key) return
+  try {
+    localStorage.setItem(key, JSON.stringify(annotationAssets.value.slice(0, 20)))
+  } catch (e: unknown) {
+    const name = e && typeof e === 'object' && 'name' in e ? String((e as { name?: string }).name) : ''
+    if (name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED') {
+      error.value =
+        'Could not save annotated drawings: browser storage is full. Remove a saved drawing or clear other site data for this site.'
+    } else {
+      error.value = 'Could not save annotated drawings.'
+    }
+  }
+}
+
+function clearSavedAnnotations() {
+  if (!selectedProjectId.value) return
+  if (!confirm('Remove all saved annotated drawings for this project?')) return
+  annotationAssets.value = []
+  persistAnnotationAssets(selectedProjectId.value)
+  error.value = ''
 }
 
 function loadPresetPrompts() {
@@ -237,6 +326,7 @@ onMounted(async () => {
     selectedProjectId.value = projects.value[0].id
     loadChatHistory(selectedProjectId.value)
     loadCollected(selectedProjectId.value)
+    loadAnnotationAssets(selectedProjectId.value)
     await refreshReadiness()
   }
 })
@@ -244,10 +334,19 @@ onMounted(async () => {
 watch(selectedProjectId, async (projectId) => {
   loadChatHistory(projectId)
   loadCollected(projectId)
+  loadAnnotationAssets(projectId)
   await refreshReadiness()
 })
 
 watch(me, () => loadPresetPrompts(), { deep: true })
+
+watch(
+  annotationAssets,
+  () => {
+    persistAnnotationAssets(selectedProjectId.value)
+  },
+  { deep: true }
+)
 
 const reportAuthor = computed(() => {
   const m = me.value
@@ -302,7 +401,7 @@ function reportDownloadOptions(report: ReportResult): DownloadOption[] {
     options.push({
       key,
       label: key.toUpperCase(),
-      onSelect: () => downloadReport(path, key),
+      onSelect: () => downloadReport(path, key, report),
     })
   }
   for (const [key, path] of Object.entries(report.downloads)) {
@@ -310,14 +409,15 @@ function reportDownloadOptions(report: ReportResult): DownloadOption[] {
     options.push({
       key,
       label: key.toUpperCase(),
-      onSelect: () => downloadReport(path, key),
+      onSelect: () => downloadReport(path, key, report),
     })
   }
   return options
 }
 
-async function downloadReport(path: string, key: string) {
+async function downloadReport(path: string, key: string, report?: ReportResult | null) {
   error.value = ''
+  const rid = report?.report_id ?? reportResult.value?.report_id ?? 'result'
   try {
     const url = fullDownloadUrl(path)
     const res = await fetch(url, {
@@ -331,7 +431,7 @@ async function downloadReport(path: string, key: string) {
     const a = document.createElement('a')
     a.href = objUrl
     const ext = extensionForReportKey(key)
-    a.download = `report-${reportResult.value?.report_id || 'result'}.${ext}`
+    a.download = `report-${rid}.${ext}`
     document.body.appendChild(a)
     a.click()
     a.remove()
@@ -534,14 +634,16 @@ async function consolidateCollectedReport() {
   annotationAssets.value = assets
   consolidating.value = true
   error.value = ''
+  consolidatedReport.value = null
   try {
-    reportResult.value = await apiFetch<ReportResult>('/ai/reports/consolidate-collection', {
+    consolidatedReport.value = await apiFetch<ReportResult>('/ai/reports/consolidate-collection', {
       method: 'POST',
       body: JSON.stringify({
         project_id: selectedProjectId.value,
         author: reportAuthor.value,
         chat_history: chatHistory.value,
-        annotation_assets: assets,
+        include_annotated_drawing: includeDrawingInCustomReport.value,
+        annotation_assets: includeDrawingInCustomReport.value ? assets : [],
         items: collectedOutputs.value.map((c) => ({
           id: c.id,
           source: c.source,
@@ -551,7 +653,8 @@ async function consolidateCollectedReport() {
         })),
       }),
     })
-    consolidatedReport.value = reportResult.value
+    await nextTick()
+    customReportAnchor.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   } catch (e: unknown) {
     const msg =
       e && typeof e === 'object' && 'data' in e
@@ -590,12 +693,22 @@ function isImageDrawing(row: UploadRow): boolean {
   return (row.content_type || '').startsWith('image/')
 }
 
-async function openAnnotation(d: UploadRow) {
+function annotationContentPath(projectId: number, fileId: number, kind: AnnotatableKind): string {
+  if (kind === 'drawing') {
+    return `/projects/by-id/${projectId}/drawings/${fileId}/content`
+  }
+  return `/projects/by-id/${projectId}/project-files/${fileId}/content`
+}
+
+async function openAnnotation(d: UploadRow, kind: AnnotatableKind) {
   if (!selectedProjectId.value || !isImageDrawing(d)) return
+  annotationSourceKind.value = kind
   annotationDrawing.value = d
-  const saved = annotationAssets.value.find((a) => a.drawing_id === d.id)
+  const saved = annotationAssets.value.find(
+    (a) => a.drawing_id === d.id && (a.source_kind ?? 'drawing') === kind
+  )
   annotationMarkers.value = saved ? saved.markers.map((m) => ({ ...m })) : []
-  const path = `/projects/by-id/${selectedProjectId.value}/drawings/${d.id}/content`
+  const path = annotationContentPath(selectedProjectId.value, d.id, kind)
   const res = await fetch(`${base()}${path}`, {
     headers: token.value ? { Authorization: `Bearer ${token.value}` } : {},
   })
@@ -612,6 +725,7 @@ async function openAnnotation(d: UploadRow) {
 
 function closeAnnotation() {
   annotationDrawing.value = null
+  annotationSourceKind.value = 'drawing'
   if (annotationObjectUrl.value) URL.revokeObjectURL(annotationObjectUrl.value)
   annotationObjectUrl.value = ''
   annotationMarkers.value = []
@@ -649,22 +763,25 @@ function buildAnnotatedImageDataUrl(): string | null {
 }
 
 function attachAnnotatedDrawingToReport() {
-  if (!annotationDrawing.value || !annotationMarkers.value.length) {
-    error.value = 'Add at least one marker before attaching drawing to report.'
+  if (!annotationDrawing.value) {
+    error.value = 'No image is open to save.'
     return
   }
   const dataUrl = buildAnnotatedImageDataUrl()
   if (!dataUrl) {
-    error.value = 'Could not render annotated drawing.'
+    error.value = 'Could not render the drawing. Wait for the image to finish loading, then try again.'
     return
   }
   const item: AnnotationAsset = {
     drawing_id: annotationDrawing.value.id,
+    source_kind: annotationSourceKind.value,
     filename: annotationDrawing.value.filename,
     image_data_url: dataUrl,
     markers: annotationMarkers.value.map((m) => ({ ...m })),
   }
-  const existingIdx = annotationAssets.value.findIndex((a) => a.drawing_id === item.drawing_id)
+  const existingIdx = annotationAssets.value.findIndex(
+    (a) => a.drawing_id === item.drawing_id && (a.source_kind ?? 'drawing') === item.source_kind
+  )
   if (existingIdx >= 0) {
     annotationAssets.value.splice(existingIdx, 1, item)
   } else {
@@ -676,21 +793,25 @@ function attachAnnotatedDrawingToReport() {
 function annotationAssetsForReport(): AnnotationAsset[] {
   const assets = annotationAssets.value.map((a) => ({
     drawing_id: a.drawing_id,
+    source_kind: a.source_kind ?? 'drawing',
     filename: a.filename,
     image_data_url: a.image_data_url,
     markers: a.markers.map((m) => ({ ...m })),
   }))
-  // Auto-include the drawing currently open in the annotation modal.
-  if (!annotationDrawing.value || !annotationMarkers.value.length) return assets
+  // Auto-include the drawing currently open in the annotation modal (with or without markers).
+  if (!annotationDrawing.value) return assets
   const dataUrl = buildAnnotatedImageDataUrl()
   if (!dataUrl) return assets
   const liveItem: AnnotationAsset = {
     drawing_id: annotationDrawing.value.id,
+    source_kind: annotationSourceKind.value,
     filename: annotationDrawing.value.filename,
     image_data_url: dataUrl,
     markers: annotationMarkers.value.map((m) => ({ ...m })),
   }
-  const idx = assets.findIndex((a) => a.drawing_id === liveItem.drawing_id)
+  const idx = assets.findIndex(
+    (a) => a.drawing_id === liveItem.drawing_id && (a.source_kind ?? 'drawing') === liveItem.source_kind
+  )
   if (idx >= 0) assets[idx] = liveItem
   else assets.push(liveItem)
   return assets
@@ -760,6 +881,7 @@ function removeAnnotationMarker(index: number) {
 }
 
 function exportAnnotatedImage() {
+  if (!annotationDrawing.value) return
   const dataUrl = buildAnnotatedImageDataUrl()
   if (!dataUrl) return
   fetch(dataUrl)
@@ -816,8 +938,8 @@ function exportAnnotatedImage() {
                   <button
                     v-if="isImageDrawing(f)"
                     type="button"
-                    class="btn btn-ghost tiny"
-                    @click="openAnnotation(f)"
+                    class="btn-annotate-launch"
+                    @click="openAnnotation(f, 'drawing')"
                   >
                     Annotate
                   </button>
@@ -840,6 +962,14 @@ function exportAnnotatedImage() {
                 <li v-for="f in analysisFiles.project_files" :key="'p-' + f.id" class="file-row">
                   <span class="fname">{{ f.filename }}</span>
                   <span class="fmeta">{{ formatBytes(f.size_bytes) }}</span>
+                  <button
+                    v-if="isImageDrawing(f)"
+                    type="button"
+                    class="btn-annotate-launch"
+                    @click="openAnnotation(f, 'project_file')"
+                  >
+                    Annotate
+                  </button>
                 </li>
                 <li v-if="!analysisFiles.project_files.length" class="muted">None</li>
               </ul>
@@ -977,7 +1107,7 @@ function exportAnnotatedImage() {
                       </button>
                     </div>
                   </div>
-                  <button type="button" class="icon-btn collect" title="Add to customized report" @click="collectChatTurn(turn)">
+                  <button type="button" class="icon-btn collect" title="Add to Custom Report" @click="collectChatTurn(turn)">
                     <svg
                       class="collect-file-icon"
                       width="18"
@@ -1039,17 +1169,71 @@ function exportAnnotatedImage() {
           </button>
         </div>
         <div v-if="annotationAssets.length" class="report-actions">
-          <span class="muted tiny attached-note">{{ annotationAssets.length }} annotated drawing(s) attached</span>
+          <span class="muted tiny attached-note"
+            >{{ annotationAssets.length }} annotated drawing(s) saved for this project (browser storage).</span
+          >
+          <button type="button" class="btn btn-ghost tiny-btn" @click="clearSavedAnnotations">Clear saved</button>
         </div>
       </section>
       </div>
 
       <aside class="panel card side-panel">
-        <h2 class="section-label">Customized report</h2>
+        <h2 class="section-label">Custom Report</h2>
         <p class="muted small">
-          Use the list icon on a message to add prompt material here, then build one customized merged report with exports
+          Use the list icon on a message to add prompt material here, then build one merged Custom Report with exports
           (PDF, Word, HTML, etc.).
         </p>
+        <div ref="customReportAnchor" class="custom-report-actions">
+          <button
+            type="button"
+            class="btn btn-primary block-btn"
+            :disabled="!selectedProjectId || !collectedOutputs.length || consolidating"
+            @click="consolidateCollectedReport"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+            </svg>
+            {{ consolidating ? 'Building…' : 'Generate Custom Report' }}
+          </button>
+          <div v-if="consolidatedReport" class="custom-report-download-row">
+            <div class="download-menu" @click.stop>
+              <button
+                type="button"
+                class="icon-btn"
+                aria-label="Download Custom Report"
+                title="Download Custom Report"
+                @click.stop="toggleDownloadMenu(`consolidated-${consolidatedReport.report_id}`)"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+                </svg>
+              </button>
+              <div
+                v-if="openDownloadMenuId === `consolidated-${consolidatedReport.report_id}`"
+                class="download-dropdown download-dropdown--raised"
+              >
+                <button
+                  v-for="opt in reportDownloadOptions(consolidatedReport)"
+                  :key="opt.key"
+                  type="button"
+                  class="download-option"
+                  @click.stop="opt.onSelect(); closeDownloadMenu()"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+            <span class="muted tiny">Custom Report ready</span>
+          </div>
+          <label class="include-drawing-row">
+            <input v-model="includeDrawingInCustomReport" type="checkbox" />
+            <span>Include Drawing</span>
+          </label>
+          <p class="muted tiny include-drawing-hint">
+            When checked, annotated images from Drawings or Project files are added as the <strong>final section</strong> of the
+            Custom Report (HTML and related exports).
+          </p>
+        </div>
         <ul class="collected-list">
           <li v-for="c in collectedOutputs" :key="c.id" class="collected-item">
             <div class="collected-top">
@@ -1065,53 +1249,23 @@ function exportAnnotatedImage() {
           </li>
         </ul>
         <p v-if="!collectedOutputs.length" class="muted small">Nothing collected yet.</p>
-        <button
-          type="button"
-          class="btn btn-primary block-btn"
-          :disabled="!selectedProjectId || !collectedOutputs.length || consolidating"
-          @click="consolidateCollectedReport"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-            <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
-          </svg>
-          {{ consolidating ? 'Building…' : 'Generate Customized Report' }}
-        </button>
-        <div v-if="consolidatedReport" class="collected-download">
-          <div class="download-menu" @click.stop>
-            <button
-              type="button"
-              class="btn btn-outline btn-sm"
-              aria-label="Download customized report"
-              @click.stop="toggleDownloadMenu(`consolidated-${consolidatedReport.report_id}`)"
-            >
-              Download customized report
-            </button>
-            <div v-if="openDownloadMenuId === `consolidated-${consolidatedReport.report_id}`" class="download-dropdown">
-              <button
-                v-for="opt in reportDownloadOptions(consolidatedReport)"
-                :key="opt.key"
-                type="button"
-                class="download-option"
-                @click.stop="opt.onSelect(); closeDownloadMenu()"
-              >
-                {{ opt.label }}
-              </button>
-            </div>
-          </div>
-          <span class="muted tiny">Customized report ready</span>
-        </div>
       </aside>
     </div>
 
     <div v-if="annotationDrawing" class="modal-backdrop" @click.self="closeAnnotation">
       <div class="card modal-card annotate-modal">
         <div class="annotate-head">
-          <h3>Drawing annotations</h3>
+          <div>
+            <h3>Image annotation</h3>
+            <p v-if="annotationDrawing" class="muted tiny annotate-source">
+              {{ annotationSourceKind === 'project_file' ? 'Project file' : 'Drawing' }} · {{ annotationDrawing.filename }}
+            </p>
+          </div>
           <button type="button" class="btn btn-ghost" @click="closeAnnotation">Close</button>
         </div>
         <p class="muted small">
-          Mark <strong class="def">deficiencies</strong> (red) or <strong class="disc">discrepancies</strong> (amber). Click the image to place a
-          marker, then edit each label in the marker list.
+          Mark <strong class="def">deficiencies</strong> (red) or <strong class="disc">discrepancies</strong> (amber). Click the image to place
+          markers (optional). You can <strong>Save Drawing</strong> with no markers to store the image as-is.
         </p>
         <div class="annotate-tools">
           <label class="radio-pill">
@@ -1122,9 +1276,15 @@ function exportAnnotatedImage() {
             <input v-model="annotationMode" type="radio" value="discrepancy" />
             Discrepancy
           </label>
-          <button type="button" class="btn btn-outline" @click="annotationMarkers = []; redrawAnnotationCanvas()">Clear markers</button>
-          <button type="button" class="btn btn-outline" @click="attachAnnotatedDrawingToReport">Attach to report</button>
-          <button type="button" class="btn btn-primary" @click="exportAnnotatedImage">Download PNG</button>
+          <button type="button" class="btn btn-outline annotate-clear-raised" @click="annotationMarkers = []; redrawAnnotationCanvas()">
+            Clear markers
+          </button>
+          <div class="annotate-primary-actions">
+            <button type="button" class="btn btn-primary annotate-raised-btn" @click="attachAnnotatedDrawingToReport">
+              Save Drawing
+            </button>
+            <button type="button" class="btn btn-primary annotate-raised-btn" @click="exportAnnotatedImage">Download PNG</button>
+          </div>
         </div>
         <div class="annotate-canvas-wrap">
           <img
@@ -1261,6 +1421,46 @@ function exportAnnotatedImage() {
 .fmeta {
   color: var(--text-muted);
   font-size: 0.75rem;
+}
+
+.btn-annotate-launch {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 0.4rem 0.76rem;
+  font-family: inherit;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  border-radius: 0.55rem;
+  cursor: pointer;
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.1),
+    0 3px 10px rgba(16, 185, 129, 0.28);
+  transition:
+    background 0.15s,
+    box-shadow 0.15s,
+    transform 0.12s,
+    filter 0.12s;
+}
+
+.btn-annotate-launch:hover {
+  filter: brightness(1.07);
+  box-shadow:
+    0 2px 6px rgba(15, 23, 42, 0.14),
+    0 5px 16px rgba(16, 185, 129, 0.35);
+  transform: translateY(-1px);
+}
+
+.btn-annotate-launch:active {
+  transform: translateY(0);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
 }
 
 .small {
@@ -1481,6 +1681,10 @@ function exportAnnotatedImage() {
   z-index: 5;
 }
 
+.download-dropdown--raised {
+  z-index: 40;
+}
+
 .download-option {
   border: none;
   background: transparent;
@@ -1642,6 +1846,49 @@ function exportAnnotatedImage() {
 .side-panel {
   position: sticky;
   top: 1rem;
+  align-self: start;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+}
+
+.custom-report-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.25rem 0 0.85rem;
+}
+
+.custom-report-download-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  width: 100%;
+  justify-content: space-between;
+}
+
+.custom-report-download-row .download-menu {
+  margin-left: auto;
+}
+
+.include-drawing-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.include-drawing-row input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--accent, #10b981);
+}
+
+.include-drawing-hint {
+  margin: -0.15rem 0 0;
+  line-height: 1.35;
 }
 
 .collected-list {
@@ -1679,14 +1926,11 @@ function exportAnnotatedImage() {
 
 .block-btn {
   width: 100%;
-  margin-top: 0.5rem;
+  margin-top: 0;
 }
 
-.collected-download {
-  margin-top: 0.5rem;
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
+.custom-report-actions .block-btn {
+  margin-top: 0;
 }
 
 .modal-backdrop {
@@ -1708,12 +1952,16 @@ function exportAnnotatedImage() {
 .annotate-head {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.5rem;
 }
 
 .annotate-head h3 {
   margin: 0;
+}
+
+.annotate-source {
+  margin: 0.2rem 0 0;
 }
 
 .annotate-tools {
@@ -1722,6 +1970,56 @@ function exportAnnotatedImage() {
   gap: 0.5rem;
   align-items: center;
   margin: 0.75rem 0;
+}
+
+.annotate-primary-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.annotate-raised-btn {
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  transition:
+    background 0.15s,
+    box-shadow 0.15s,
+    transform 0.12s,
+    filter 0.12s;
+}
+
+.annotate-raised-btn:hover:not(:disabled) {
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.16), 0 4px 14px rgba(16, 185, 129, 0.22);
+  transform: translateY(-1px);
+  filter: brightness(1.06);
+}
+
+.annotate-raised-btn:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.14);
+}
+
+.annotate-clear-raised {
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.1), 0 2px 5px rgba(15, 23, 42, 0.06);
+  transition:
+    background 0.15s,
+    box-shadow 0.15s,
+    transform 0.12s,
+    border-color 0.12s;
+}
+
+.annotate-clear-raised:hover:not(:disabled) {
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12), 0 3px 10px rgba(15, 23, 42, 0.08);
+  transform: translateY(-1px);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.annotate-clear-raised:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.1);
 }
 
 .radio-pill {
