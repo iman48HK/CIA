@@ -1,8 +1,9 @@
 from pathlib import Path
 from uuid import uuid4
 
+import fitz
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -77,6 +78,28 @@ def _workspace_folder(db: Session, folder_id: int, user: User) -> ProjectWorkspa
     if not folder:
         raise HTTPException(status_code=404, detail="Workspace folder not found")
     return folder
+
+
+def _is_raster_image_upload(content_type: str | None) -> bool:
+    return (content_type or "").lower().startswith("image/")
+
+
+def _is_pdf_upload(content_type: str | None, filename: str | None) -> bool:
+    ct = (content_type or "").lower()
+    fn = (filename or "").lower()
+    return ct == "application/pdf" or fn.endswith(".pdf")
+
+
+def _pdf_first_page_png(path: Path, dpi: float = 144.0) -> bytes:
+    doc = fitz.open(path)
+    try:
+        page = doc[0]
+        zoom = dpi / 72.0
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        return pix.tobytes("png")
+    finally:
+        doc.close()
 
 
 def _store_upload(project_id: int, upload: UploadFile, category: str) -> tuple[str, int]:
@@ -425,6 +448,39 @@ def get_project_drawing_content(
     return FileResponse(path, media_type=row.content_type, filename=row.filename)
 
 
+@router.get("/by-id/{project_id}/drawings/{drawing_id}/annotation-preview")
+def get_drawing_annotation_preview(
+    project_id: int,
+    drawing_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Raster image bytes as stored, or first PDF page as PNG for browser annotation."""
+    _project(db, project_id, user)
+    row = (
+        db.query(ProjectDrawingUpload)
+        .filter(ProjectDrawingUpload.project_id == project_id, ProjectDrawingUpload.id == drawing_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Drawing upload not found")
+    path = Path(row.file_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Drawing file missing on disk")
+    if _is_raster_image_upload(row.content_type):
+        return FileResponse(path, media_type=row.content_type, filename=row.filename)
+    if _is_pdf_upload(row.content_type, row.filename):
+        try:
+            png = _pdf_first_page_png(path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not rasterize PDF: {e}") from e
+        return Response(content=png, media_type="image/png")
+    raise HTTPException(
+        status_code=415,
+        detail="Annotation preview is only available for raster images (PNG, JPEG, …) or PDF drawings.",
+    )
+
+
 @router.get("/by-id/{project_id}/project-files", response_model=list[ProjectUploadOut])
 def list_project_files(
     project_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)
@@ -491,6 +547,38 @@ def get_project_file_content(
     if not path.exists():
         raise HTTPException(status_code=404, detail="Project file missing on disk")
     return FileResponse(path, media_type=row.content_type, filename=row.filename)
+
+
+@router.get("/by-id/{project_id}/project-files/{file_id}/annotation-preview")
+def get_project_file_annotation_preview(
+    project_id: int,
+    file_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _project(db, project_id, user)
+    row = (
+        db.query(ProjectFileUpload)
+        .filter(ProjectFileUpload.project_id == project_id, ProjectFileUpload.id == file_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Project file not found")
+    path = Path(row.file_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Project file missing on disk")
+    if _is_raster_image_upload(row.content_type):
+        return FileResponse(path, media_type=row.content_type, filename=row.filename)
+    if _is_pdf_upload(row.content_type, row.filename):
+        try:
+            png = _pdf_first_page_png(path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not rasterize PDF: {e}") from e
+        return Response(content=png, media_type="image/png")
+    raise HTTPException(
+        status_code=415,
+        detail="Annotation preview is only available for raster images or PDF files.",
+    )
 
 
 @router.get("/by-id/{project_id}/ordinance-selections", response_model=list[int])

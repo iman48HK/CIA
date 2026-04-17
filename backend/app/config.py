@@ -15,6 +15,8 @@ class Settings(BaseSettings):
         "http://localhost:3000,http://localhost:3001,"
         "http://127.0.0.1:3000,http://127.0.0.1:3001"
     )
+    # PDF exports: Chromium (Playwright) matches the HTML report; set false to use xhtml2pdf only.
+    report_pdf_chromium: bool = True
 
 
 settings = Settings()

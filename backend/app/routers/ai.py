@@ -1,21 +1,21 @@
 import httpx
 import json
-import csv
 import base64
 import binascii
+import math
 import re
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 from html import escape
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import FileResponse
 
 from app.config import settings
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.deps import get_current_user
 from app.models import (
     OrdinanceFile,
@@ -23,6 +23,7 @@ from app.models import (
     ProjectDrawingUpload,
     ProjectFileUpload,
     ProjectOrdinanceSelection,
+    ReportJob,
     User,
 )
 from app.schemas import AIChatRequest, AIChatResponse
@@ -35,6 +36,96 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 REPORTS_DIR = Path(__file__).resolve().parents[2] / "storage" / "reports"
 REPORT_BRAND_HEADER = "Construction Insight Agent"
+# One stack for HTML/PDF/Word: common on Windows + Linux PDF engines; avoids mixed serif/mono in exports.
+REPORT_FONT_STACK = '"Segoe UI", Arial, Helvetica, "Liberation Sans", sans-serif'
+REPORT_FONT_STACK_XML = "Segoe UI, Arial, Helvetica, Liberation Sans, sans-serif"
+
+# Report PDF viewport width (px): matches .wrap max-width 920 + horizontal padding in report CSS.
+_REPORT_PDF_PAGE_WIDTH_PX = 992
+_REPORT_PDF_MAX_HEIGHT_PX = 50_000
+
+
+def _html_to_pdf_bytes_xhtml2pdf(html: str) -> bytes:
+    from io import BytesIO
+
+    from xhtml2pdf import pisa
+
+    buf = BytesIO()
+    pisa.CreatePDF(BytesIO(html.encode("utf-8")), dest=buf, encoding="utf-8")
+    return buf.getvalue()
+
+
+def _trim_trailing_blank_pdf_pages(pdf_bytes: bytes) -> bytes:
+    """Chromium sometimes emits an extra empty page for custom paper sizes; drop trailing pages with no text."""
+    import fitz
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return pdf_bytes
+    try:
+        while doc.page_count > 1:
+            last = doc[-1]
+            if last.get_text().strip() or last.get_images():
+                break
+            doc.delete_page(doc.page_count - 1)
+        return doc.tobytes()
+    finally:
+        doc.close()
+
+
+def _html_to_pdf_bytes_chromium(html: str) -> bytes:
+    """Print the same HTML the user downloads, using headless Chromium (screen media, full-page height)."""
+    from playwright.sync_api import sync_playwright
+
+    w = _REPORT_PDF_PAGE_WIDTH_PX
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(viewport={"width": w, "height": min(1600, _REPORT_PDF_MAX_HEIGHT_PX)})
+            page.emulate_media(media="screen")
+            page.set_content(html, wait_until="load", timeout=120_000)
+            try:
+                page.evaluate("() => document.fonts.ready")
+            except Exception:
+                pass
+            page.wait_for_timeout(200)
+            height_px = int(
+                page.evaluate(
+                    """() => Math.ceil(Math.max(
+                        document.body ? document.body.scrollHeight : 0,
+                        document.documentElement ? document.documentElement.scrollHeight : 0
+                    ))"""
+                )
+            )
+            height_px = max(min(height_px + 40, _REPORT_PDF_MAX_HEIGHT_PX), 400)
+            raw = page.pdf(
+                print_background=True,
+                width=f"{w}px",
+                height=f"{height_px}px",
+                margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+            )
+            return _trim_trailing_blank_pdf_pages(raw)
+        finally:
+            browser.close()
+
+
+def _html_to_pdf_bytes_for_report(html: str) -> bytes:
+    if settings.report_pdf_chromium:
+        try:
+            return _html_to_pdf_bytes_chromium(html)
+        except Exception:
+            pass
+    return _html_to_pdf_bytes_xhtml2pdf(html)
+
+
+def _apply_report_docx_base_font(document: object) -> None:
+    """Align Word export with report HTML sans stack (Arial matches PDF/HTML fallbacks)."""
+    from docx.shared import Pt
+
+    normal = document.styles["Normal"]
+    normal.font.name = "Arial"
+    normal.font.size = Pt(11)
 
 
 class ProjectAIChatRequest(AIChatRequest):
@@ -81,6 +172,46 @@ class ConsolidateCollectionReportRequest(BaseModel):
     author: str | None = Field(default=None, max_length=200)
 
 
+class CustomReportJobAccepted(BaseModel):
+    job_id: int
+    status: str = "pending"
+
+
+class CustomReportJobStatusOut(BaseModel):
+    job_id: int
+    status: str
+    report_type: str | None = None
+    report_id: str | None = None
+    downloads: dict[str, str] | None = None
+    error_message: str | None = None
+
+
+class StandardReportJobAccepted(BaseModel):
+    job_id: int
+    status: str = "pending"
+
+
+class StandardReportJobStatusOut(BaseModel):
+    job_id: int
+    status: str
+    report_type: str | None = None
+    report_id: str | None = None
+    downloads: dict[str, str] | None = None
+    error_message: str | None = None
+
+
+class ChatJobAccepted(BaseModel):
+    job_id: int
+    status: str = "pending"
+
+
+class ChatJobStatusOut(BaseModel):
+    job_id: int
+    status: str
+    reply: str | None = None
+    error_message: str | None = None
+
+
 async def _request_openrouter(model: str, message: str, headers: dict[str, str]) -> httpx.Response:
     system = (
         "You are AI Assistant for construction projects. "
@@ -92,7 +223,7 @@ async def _request_openrouter(model: str, message: str, headers: dict[str, str])
         "## Recommended Actions\n"
         "- Actionable next steps\n\n"
         "## References / Citations\n"
-        "- Cite standards, ordinance docs, or assumptions used\n\n"
+        "- Cite only project-scoped sources: Drawings, Project Files, and Selected Ordinance Docs\n\n"
         "## Confidence\n"
         "- confidence_score: <0-100>\n"
         "- doubt_score: <0-100>\n"
@@ -100,7 +231,9 @@ async def _request_openrouter(model: str, message: str, headers: dict[str, str])
         "Rules:\n"
         "- Be concise and practical.\n"
         "- If data is missing, explicitly state assumptions.\n"
-        "- Never invent citations; if unavailable, say so.\n"
+        "- Use only project documents as references (Drawings / Project Files / Selected Ordinance Docs).\n"
+        "- Never cite outside sources or general web/standards references.\n"
+        "- Never invent citations; if unavailable, say so using project document gaps only.\n"
         "- Use clear headings and bullet points only (no long paragraphs)."
     )
     payload = {
@@ -125,7 +258,7 @@ def _request_openrouter_sync(model: str, message: str, headers: dict[str, str]) 
         "## Recommended Actions\n"
         "- Actionable next steps\n\n"
         "## References / Citations\n"
-        "- Cite standards, ordinance docs, or assumptions used\n\n"
+        "- Cite only project-scoped sources: Drawings, Project Files, and Selected Ordinance Docs\n\n"
         "## Confidence\n"
         "- confidence_score: <0-100>\n"
         "- doubt_score: <0-100>\n"
@@ -133,7 +266,9 @@ def _request_openrouter_sync(model: str, message: str, headers: dict[str, str]) 
         "Rules:\n"
         "- Be concise and practical.\n"
         "- If data is missing, explicitly state assumptions.\n"
-        "- Never invent citations; if unavailable, say so.\n"
+        "- Use only project documents as references (Drawings / Project Files / Selected Ordinance Docs).\n"
+        "- Never cite outside sources or general web/standards references.\n"
+        "- Never invent citations; if unavailable, say so using project document gaps only.\n"
         "- Use clear headings and bullet points only (no long paragraphs)."
     )
     payload = {
@@ -224,8 +359,56 @@ async def chat(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Assistant interactions are project-scoped.
-    project = db.query(Project).filter(Project.id == body.project_id, Project.owner_id == user.id).first()
+    reply = _run_single_chat_reply(body.project_id, user.id, body.message, db)
+    return AIChatResponse(reply=reply)
+
+
+@router.post("/chat/jobs", response_model=ChatJobAccepted)
+def enqueue_chat_job(
+    body: ProjectAIChatRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _validate_chat_prereqs(body.project_id, user.id, db)
+    job = ReportJob(
+        owner_id=user.id,
+        project_id=body.project_id,
+        kind="chat_reply",
+        status="pending",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    background_tasks.add_task(_run_chat_job_task, job.id, body.project_id, user.id, body.message)
+    return ChatJobAccepted(job_id=job.id, status="pending")
+
+
+@router.get("/chat/jobs/{job_id}", response_model=ChatJobStatusOut)
+def get_chat_job_status(
+    job_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = (
+        db.query(ReportJob)
+        .filter(ReportJob.id == job_id, ReportJob.owner_id == user.id, ReportJob.kind == "chat_reply")
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Chat job not found")
+    payload = json.loads(job.downloads_json) if job.downloads_json else {}
+    reply = payload.get("reply") if isinstance(payload, dict) else None
+    return ChatJobStatusOut(
+        job_id=job.id,
+        status=job.status,
+        reply=reply if isinstance(reply, str) else None,
+        error_message=job.error_message,
+    )
+
+
+def _validate_chat_prereqs(project_id: int, owner_id: int, db: Session) -> Project:
+    project = db.query(Project).filter(Project.id == project_id, Project.owner_id == owner_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     drawing_rows = (
@@ -250,6 +433,28 @@ async def chat(
             status_code=400,
             detail="Select at least one ordinance document for this project before asking CIA Assistant.",
         )
+    if not settings.openrouter_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenRouter API key not configured. Set OPENROUTER_API_KEY in backend .env",
+        )
+    return project
+
+
+def _run_single_chat_reply(project_id: int, owner_id: int, message: str, db: Session) -> str:
+    project = _validate_chat_prereqs(project_id, owner_id, db)
+    drawing_rows = (
+        db.query(ProjectDrawingUpload)
+        .filter(ProjectDrawingUpload.project_id == project.id)
+        .order_by(ProjectDrawingUpload.id.desc())
+        .all()
+    )
+    selected_ordinance_ids = [
+        oid
+        for (oid,) in db.query(ProjectOrdinanceSelection.ordinance_file_id)
+        .filter(ProjectOrdinanceSelection.project_id == project.id)
+        .all()
+    ]
     ordinance_titles = [
         title
         for (title,) in db.query(OrdinanceFile.title)
@@ -263,51 +468,62 @@ async def chat(
         .order_by(ProjectFileUpload.id.desc())
         .all()
     ]
-    if not settings.openrouter_api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="OpenRouter API key not configured. Set OPENROUTER_API_KEY in backend .env",
-        )
-
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "HTTP-Referer": "http://localhost:3000",
         "X-Title": "Construction Insight Agent",
         "Content-Type": "application/json",
     }
-
+    scoped_message = (
+        f"[Project: {project.name} | Project ID: {project.id}]\n"
+        f"[Drawings: {', '.join([d.filename for d in drawing_rows])}]\n"
+        f"[Selected Ordinance Docs: {', '.join(ordinance_titles)}]\n"
+        f"[Optional Project Files: {', '.join(project_file_names) if project_file_names else 'None'}]\n"
+        f"{message}"
+    )
     try:
-        scoped_message = (
-            f"[Project: {project.name} | Project ID: {project.id}]\n"
-            f"[Drawings: {', '.join([d.filename for d in drawing_rows])}]\n"
-            f"[Selected Ordinance Docs: {', '.join(ordinance_titles)}]\n"
-            f"[Optional Project Files: {', '.join(project_file_names) if project_file_names else 'None'}]\n"
-            f"{body.message}"
-        )
-        r = await _request_openrouter(settings.openrouter_model, scoped_message, headers)
-    except httpx.HTTPError as e:
+        r = _request_openrouter_sync(settings.openrouter_model, scoped_message, headers)
+        if r.status_code != 200 and settings.openrouter_fallback_model:
+            r = _request_openrouter_sync(settings.openrouter_fallback_model, scoped_message, headers)
+    except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenRouter request failed: {e}") from e
-
-    # Fallback model if primary model fails.
-    if r.status_code != 200 and settings.openrouter_fallback_model:
-        try:
-            r = await _request_openrouter(settings.openrouter_fallback_model, scoped_message, headers)
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"OpenRouter request failed: {e}") from e
-
     if r.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"OpenRouter error: {r.status_code} {r.text[:500]}",
-        )
-
+        raise HTTPException(status_code=502, detail=f"OpenRouter error: {r.status_code} {r.text[:500]}")
     data = r.json()
     try:
-        reply = data["choices"][0]["message"]["content"]
+        reply = str(data["choices"][0]["message"]["content"] or "")
     except (KeyError, IndexError) as e:
         raise HTTPException(status_code=502, detail="Unexpected OpenRouter response") from e
+    return reply
 
-    return AIChatResponse(reply=reply or "")
+
+def _run_chat_job_task(job_id: int, project_id: int, owner_id: int, message: str) -> None:
+    db = SessionLocal()
+    try:
+        job = (
+            db.query(ReportJob)
+            .filter(ReportJob.id == job_id, ReportJob.owner_id == owner_id, ReportJob.kind == "chat_reply")
+            .first()
+        )
+        if not job:
+            return
+        job.status = "running"
+        db.commit()
+        reply = _run_single_chat_reply(project_id, owner_id, message, db)
+        job.status = "completed"
+        job.downloads_json = json.dumps({"reply": reply})
+        job.completed_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        job = db.query(ReportJob).filter(ReportJob.id == job_id).first()
+        if job:
+            job.status = "failed"
+            job.error_message = (str(e) or "Chat job failed")[:4000]
+            job.completed_at = datetime.now(timezone.utc)
+            db.commit()
+    finally:
+        db.close()
 
 
 def _normalize_chat_text(s: str) -> str:
@@ -358,7 +574,8 @@ def _normalize_section_name(name: str) -> str:
     return n
 
 
-def _merged_sections_from_collected_prompts(items: list[CollectedMaterialIn], chat_history: list[dict]) -> dict[str, str]:
+def _merged_sections_from_collected_materials(items: list[CollectedMaterialIn]) -> dict[str, str]:
+    """Merge Markdown sections from collected assistant outputs (no extra AI calls)."""
     core_map = {
         "quick summary": "Quick Summary",
         "key findings": "Key Findings",
@@ -368,15 +585,12 @@ def _merged_sections_from_collected_prompts(items: list[CollectedMaterialIn], ch
     }
     core_sections: dict[str, list[str]] = {v: [] for v in core_map.values()}
     extra_sections: dict[str, list[str]] = {}
-    prompt_specific: dict[str, str] = {}
 
-    selected_prompts = [i.text.strip() for i in items if i.text.strip()]
-    for idx, prompt in enumerate(selected_prompts, start=1):
-        reply = _assistant_reply_after_user_message(chat_history, prompt)
-        prompt_specific[f"Prompt {idx}"] = (
-            f"User message:\n{prompt}\n\nAssistant reply:\n{reply}"
-        )
-        parsed = _parse_markdown_sections(reply)
+    for item in items:
+        text = (item.text or "").strip()
+        if not text:
+            continue
+        parsed = _parse_markdown_sections(text)
         for heading, body in parsed.items():
             norm = _normalize_section_name(heading)
             target = core_map.get(norm)
@@ -396,49 +610,61 @@ def _merged_sections_from_collected_prompts(items: list[CollectedMaterialIn], ch
         if joined:
             merged[f"Additional: {heading}"] = joined
 
-    return {**merged, **prompt_specific}
+    return merged
 
 
 def _reference_generated_sections() -> dict:
-    """Illustrative / template blocks (shown after prompt-driven sections in exports)."""
+    """Structured report blocks constrained to project-scoped references."""
     return {
         "4.1": (
-            "Space intelligence: detect rooms and labels from drawings, capture dimensions, symbols, "
-            "and material callouts. Outputs feed the area and compliance summaries below."
+            "Space inventory from drawings: room labels, dimensions, symbols, and material callouts "
+            "with stated measurement units (metric / imperial as declared on sheets)."
         ),
         "4.2": (
-            "Area logic: compute Gross Floor Area (GFA) versus usable/net area, reconcile boundary "
-            "ambiguities, and flag where geometry or OCR confidence is low."
+            "Gross vs usable areas: reconcile boundaries, mezzanines, and exclusions; surface assumptions "
+            "where linework or scale is ambiguous."
         ),
         "4.3": (
-            "Space-type roll-up: tabulate gross_m2, usable_m2, counts, and efficiency ratios with "
-            "floor-wise splits where drawings support it."
+            "Space Types Summary: gross, usable, counts, percentages, floor-wise breakdown, and "
+            "efficiency ratio — all in the project’s stated measurement units."
         ),
-        "4.4": (
-            "Dashboards: totals, distributions, and pie-chart-ready aggregates for stakeholder review "
-            "(illustrative until live metrics are wired in)."
-        ),
+        "4.4": {
+            "chart_title": "Space types by area (illustrative)",
+            "slices": [
+                {"label": "Office", "area": 1240, "pct": 38},
+                {"label": "Circulation", "area": 520, "pct": 16},
+                {"label": "MEP / riser", "area": 310, "pct": 10},
+                {"label": "Amenity", "area": 680, "pct": 21},
+                {"label": "Other", "area": 480, "pct": 15},
+            ],
+        },
         "4.5": {
             "manual_reinspection_required": [
                 {
                     "item": "North stair dimension extraction",
                     "doubt_score": 78,
                     "manual_review_reason": "Low OCR confidence on boundary text",
-                }
+                },
+                {
+                    "item": "Ceiling height schedule vs reflected ceiling plan",
+                    "doubt_score": 62,
+                    "manual_review_reason": "Conflicting annotations between RCP and door schedule",
+                },
             ]
         },
         "4.6": (
-            "Corrective actions: LLM-suggested fixes tied to cited rules and drawing references "
-            "(MVP placeholder until extraction pipeline is connected)."
+            "AI-generated suggestions for fixes: prioritized corrective actions tied to cited rules, "
+            "drawing references, and re-measurement steps."
         ),
         "4.7": (
-            "Toolchain: planned LangGraph-style flow (retrieve, check, summarize, area, doubt scoring). "
-            "This report section documents intent, not live tool traces."
+            "Pipeline note: regulations parsing → structured rules → automated compliance checks with "
+            "citations strictly tied to Selected Ordinance Docs and drawing/project-file evidence."
         ),
         "compliance": {
-            "status": "MVP parser output",
+            "status": "Structured rules vs project evidence",
             "citations": [
-                {"section": "HK Code Sec. 12.4", "drawing_page": "A-103"}
+                {"section": "Selected Ordinance Doc: section reference", "drawing_page": "A-103"},
+                {"section": "Selected Ordinance Doc: accessibility clause reference", "drawing_page": "G-201"},
             ],
         },
     }
@@ -468,7 +694,9 @@ def _report_payload(
     base = {
         "project_id": project_id,
         "generated_sections": generated,
-        "citations": [{"source": "HK regulation sample", "confidence": 0.76, "doubt_score": 24}],
+        "citations": [
+            {"source": "Selected Ordinance Docs + Drawings + Project Files", "confidence": 0.76, "doubt_score": 24}
+        ],
         "annotated_preview_note": "Issue overlays should be shown in red on drawing previews.",
         "chart_metrics": {
             "title": "Review metrics (illustrative)",
@@ -522,7 +750,8 @@ def _html_svg_bar_dashboard(chart: dict | None) -> str:
     parts = [
         '<div class="dashboard">',
         f'<h2 class="section-title">{title}</h2>',
-        f'<svg viewBox="0 0 {w} {svg_h}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bar chart">',
+        f'<svg viewBox="0 0 {w} {svg_h}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bar chart" '
+        f'style="font-family: {REPORT_FONT_STACK_XML}">',
     ]
     y = 44
     for b in bars:
@@ -536,65 +765,6 @@ def _html_svg_bar_dashboard(chart: dict | None) -> str:
         y += row_h
     parts.append("</svg></div>")
     return "\n".join(parts)
-
-
-def _generated_section_value_as_text(v: object) -> str:
-    """Single-cell plain text for structured section values (JSON for nested data)."""
-    if v is None:
-        return ""
-    if isinstance(v, str):
-        return v
-    return json.dumps(v, ensure_ascii=False, indent=2)
-
-
-def _section_rows_from_payload(payload: dict) -> list[list[str]]:
-    return [
-        [str(k), _generated_section_value_as_text(v)]
-        for k, v in (payload.get("generated_sections") or {}).items()
-    ]
-
-
-def _pdf_table_cell_markup(text: str) -> str:
-    """ReportLab Paragraph expects XML-safe text; newlines become explicit breaks."""
-    return xml_escape(str(text)).replace("\n", "<br/>").replace("\r", "")
-
-
-def _html_structured_section_cell_body(raw: str) -> str:
-    """Rich HTML for prompt+reply blocks; plain pre for everything else."""
-    sep = "\n\nAssistant reply:\n"
-    if sep not in raw:
-        return f'<pre class="section-value">{escape(raw)}</pre>'
-    head, tail = raw.split(sep, 1)
-    head_html = f'<pre class="section-value section-prompt-part">{escape(head)}</pre>'
-    reply_html = md.markdown(tail.strip(), extensions=["tables", "fenced_code", "sane_lists"])
-    return (
-        '<div class="section-mixed">'
-        f"{head_html}"
-        f'<div class="section-reply-wrap"><strong class="reply-label">Assistant reply</strong>'
-        f'<div class="reply section-reply-body">{reply_html}</div></div>'
-        "</div>"
-    )
-
-
-def _html_generated_sections_table(section_rows: list[list[str]]) -> str:
-    if not section_rows:
-        return ""
-    rows = "".join(
-        "<tr>"
-        f'<th scope="row" class="section-key">{escape(key)}</th>'
-        f'<td class="section-cell">{_html_structured_section_cell_body(val)}</td>'
-        "</tr>"
-        for key, val in section_rows
-    )
-    return f"""
-    <section class="block">
-      <h2 class="section-title">Structured sections</h2>
-      <table class="data-table">
-        <thead><tr><th>Section</th><th>Summary / detail</th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
-    </section>
-    """
 
 
 def _html_annotation_table(payload: dict) -> str:
@@ -661,6 +831,118 @@ def _html_attached_annotations(payload: dict) -> str:
     """
 
 
+def _html_space_type_pie_section(gs: dict) -> str:
+    raw = gs.get("4.4")
+    if not isinstance(raw, dict):
+        return ""
+    title = escape(str(raw.get("chart_title", "Space types by area")))
+    slices = raw.get("slices") or []
+    if not isinstance(slices, list) or not slices:
+        return ""
+    colors = ["#10b981", "#0d9488", "#14b8a6", "#5eead4", "#94a3b8", "#64748b", "#334155"]
+    cx, cy, r = 120, 120, 88
+
+    def _pt(angle_deg: float) -> tuple[float, float]:
+        rad = math.radians(angle_deg)
+        return cx + r * math.cos(rad), cy + r * math.sin(rad)
+
+    parts = [
+        '<section class="block exec-card">',
+        f'<h2 class="section-title">{title}</h2>',
+        '<div class="pie-wrap"><svg viewBox="0 0 280 240" xmlns="http://www.w3.org/2000/svg" role="img" '
+        f'aria-label="Pie chart" style="font-family: {REPORT_FONT_STACK_XML}">',
+    ]
+    start = -90.0
+    total = sum(float(s.get("area", 0) or 0) for s in slices if isinstance(s, dict)) or 1.0
+    for i, s in enumerate(slices):
+        if not isinstance(s, dict):
+            continue
+        frac = float(s.get("area", 0) or 0) / total
+        if frac <= 0:
+            continue
+        angle = frac * 360.0
+        end = start + angle
+        x1, y1 = _pt(start)
+        x2, y2 = _pt(end)
+        large = 1 if angle > 180 else 0
+        color = colors[i % len(colors)]
+        parts.append(
+            f'<path d="M {cx} {cy} L {x1:.2f} {y1:.2f} A {r} {r} 0 {large} 1 {x2:.2f} {y2:.2f} Z" fill="{escape(color)}" stroke="#fff" stroke-width="1"/>'
+        )
+        start = end
+    parts.append("</svg>")
+    parts.append('<ul class="pie-legend">')
+    for i, s in enumerate(slices):
+        if not isinstance(s, dict):
+            continue
+        lbl = escape(str(s.get("label", "")))
+        area = escape(str(s.get("area", "")))
+        pct = escape(str(s.get("pct", "")))
+        sw = colors[i % len(colors)]
+        parts.append(
+            f'<li><span class="swatch" style="background:{escape(sw)}"></span>'
+            f"<strong>{lbl}</strong> — {area} ({pct}%)</li>"
+        )
+    parts.append("</ul></div></section>")
+    return "\n".join(parts)
+
+
+def _html_manual_reinspection_section(gs: dict) -> str:
+    raw = gs.get("4.5")
+    if not isinstance(raw, dict):
+        return ""
+    rows = raw.get("manual_reinspection_required") or []
+    if not isinstance(rows, list) or not rows:
+        return ""
+    cards = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = escape(str(row.get("item", "")))
+        score = escape(str(row.get("doubt_score", "")))
+        reason = escape(str(row.get("manual_review_reason", "")))
+        cards.append(
+            f'<div class="reinspect-card"><div class="reinspect-top">'
+            f'<strong>{item}</strong><span class="doubt-pill">doubt_score {score}</span></div>'
+            f'<p class="reinspect-reason">{reason}</p></div>'
+        )
+    inner = "".join(cards)
+    return f"""
+    <section class="block reinspect-banner">
+      <h2 class="reinspect-title">Manual Re-inspection Required</h2>
+      <p class="lead reinspect-lead">Items below exceed confidence thresholds or have missing inputs. Re-verify on sheets before approval.</p>
+      <div class="reinspect-grid">{inner}</div>
+    </section>
+    """
+
+
+def _html_compliance_banner(gs: dict) -> str:
+    comp = gs.get("compliance")
+    if not isinstance(comp, dict):
+        return ""
+    status = escape(str(comp.get("status", "")))
+    cites = comp.get("citations") or []
+    if not isinstance(cites, list):
+        cites = []
+    cite_lines = []
+    for c in cites[:12]:
+        if not isinstance(c, dict):
+            continue
+        cite_lines.append(
+            "<li>"
+            f"<strong>{escape(str(c.get('section', '')))}</strong>"
+            f" — sheet {escape(str(c.get('drawing_page', '')))}</li>"
+        )
+    ul = f"<ul class='cite-list'>{''.join(cite_lines)}</ul>" if cite_lines else ""
+    return f"""
+    <section class="block compliance-card">
+      <h2 class="section-title">Ordinance comparison &amp; citations</h2>
+      <p class="compliance-status"><strong>Status:</strong> {status}</p>
+      {ul}
+    </section>
+    """
+
+
 def _decode_png_data_url(data_url: str) -> bytes | None:
     prefix = "data:image/png;base64,"
     if not data_url.startswith(prefix):
@@ -674,9 +956,6 @@ def _decode_png_data_url(data_url: str) -> bytes | None:
 
 def _write_report_files(report_id: str, payload: dict) -> dict:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    json_path = REPORTS_DIR / f"{report_id}.json"
-    csv_path = REPORTS_DIR / f"{report_id}.csv"
-    xlsx_path = REPORTS_DIR / f"{report_id}.xlsx"
     pdf_path = REPORTS_DIR / f"{report_id}.pdf"
     docx_path = REPORTS_DIR / f"{report_id}.docx"
     html_path = REPORTS_DIR / f"{report_id}.html"
@@ -689,15 +968,6 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
     generated_at = str(payload.get("generated_at") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
     chat_rows = payload.get("chat_history") or []
-    text_lines = []
-    for row in chat_rows:
-        role = str(row.get("role", "assistant")).upper()
-        created_at = str(row.get("created_at", ""))
-        text = str(row.get("text", ""))
-        text_lines.append(f"[{role}] {created_at}")
-        text_lines.append(text)
-        text_lines.append("")
-    full_chat_text = "\n".join(text_lines).strip() or "No transcript included."
 
     chat_blocks_html: list[str] = []
     for row in chat_rows:
@@ -708,7 +978,7 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
             body_html = md.markdown(text, extensions=["tables", "fenced_code", "sane_lists"])
         else:
             body_html = f"<p>{escape(text).replace(chr(10), '<br/>')}</p>"
-        label = "AI Assistant" if role == "assistant" else "You"
+        label = "AI Assistant" if role == "assistant" else "Source"
         chat_blocks_html.append(
             f"""
             <article class="chat-item {escape(role)}">
@@ -718,9 +988,12 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
             """.strip()
         )
 
+    gs = payload.get("generated_sections") or {}
     chart_html = _html_svg_bar_dashboard(payload.get("chart_metrics"))
-    section_rows = _section_rows_from_payload(payload)
-    sections_html = _html_generated_sections_table(section_rows)
+    manual_html = _html_manual_reinspection_section(gs if isinstance(gs, dict) else {})
+    comp_html = _html_compliance_banner(gs if isinstance(gs, dict) else {})
+    pie_html = _html_space_type_pie_section(gs if isinstance(gs, dict) else {})
+    featured_row = f'<div class="exec-row">{chart_html}{pie_html}</div>' if (chart_html or pie_html) else ""
     ann_html = _html_annotation_table(payload)
     attached_ann_html = _html_attached_annotations(payload)
 
@@ -742,11 +1015,14 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
   <meta charset="utf-8" />
   <title>{escape(REPORT_BRAND_HEADER)} — {escape(report_title)} — {escape(report_id)}</title>
   <style>
-    body {{ font-family: "Segoe UI", system-ui, sans-serif; margin: 0; color: #0f172a; background: #f8fafc; line-height: 1.55; }}
+    :root {{ --report-font: {REPORT_FONT_STACK}; }}
+    html, body {{ font-family: var(--report-font); margin: 0; color: #0f172a; background: #f8fafc; line-height: 1.55; }}
+    .wrap, .wrap * {{ font-family: var(--report-font); }}
+    svg text {{ font-family: var(--report-font); }}
     .wrap {{ max-width: 920px; margin: 0 auto; padding: 32px 24px 48px; background: #fff; min-height: 100vh;
       box-shadow: 0 1px 3px rgba(15,23,42,0.08); }}
     .report-header {{ border-bottom: 2px solid #10b981; padding-bottom: 20px; margin-bottom: 28px; }}
-    .report-header h1 {{ margin: 0 0 4px; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }}
+    .report-header h1 {{ margin: 0 0 4px; font-size: 1.75rem; font-weight: 700; letter-spacing: 0; }}
     .report-subhead {{ margin: 0 0 10px; font-size: 1.05rem; font-weight: 600; color: #334155; }}
     .meta {{ color: #64748b; font-size: 0.9rem; display: flex; flex-wrap: wrap; gap: 12px 24px; }}
     .meta strong {{ color: #334155; }}
@@ -760,21 +1036,13 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
     .data-table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; margin: 12px 0; }}
     .data-table th, .data-table td {{ border: 1px solid #e2e8f0; padding: 10px 12px; text-align: left; vertical-align: top; }}
     .data-table thead th {{ background: #d1fae5; font-weight: 600; }}
-    .data-table tbody th.section-key {{ background: #ecfdf5; font-weight: 600; width: 11rem; max-width: 32%; }}
-    .data-table td.section-cell {{ width: auto; }}
-    .section-value {{ margin: 0; white-space: pre-wrap; word-break: break-word; font-family: Consolas, ui-monospace, monospace; font-size: 0.82rem; line-height: 1.45; }}
-    .section-mixed {{ display: flex; flex-direction: column; gap: 0.75rem; }}
-    .section-prompt-part {{ max-height: 16rem; overflow: auto; background: #f8fafc; border-radius: 6px; padding: 0.5rem 0.65rem; }}
-    .section-reply-wrap {{ border-left: 3px solid #10b981; padding-left: 0.75rem; }}
-    .reply-label {{ display: block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: #64748b; margin-bottom: 0.35rem; }}
-    .section-reply-body {{ font-size: 0.9rem; }}
     .pill {{ display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }}
     .pill-deficiency {{ background: #fee2e2; color: #991b1b; }}
     .pill-discrepancy {{ background: #ffedd5; color: #9a3412; }}
     .transcript h2 {{ margin-top: 0; }}
     .chat-item {{ border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; background: #fff; }}
     .chat-item.user {{ border-color: #10b981; background: #f0fdf4; }}
-    .chat-role {{ font-size: 0.75rem; color: #64748b; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.04em; }}
+    .chat-role {{ font-size: 0.75rem; color: #64748b; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0; }}
     .reply {{ font-size: 0.95rem; }}
     .reply h1 {{ font-size: 1.35rem; }}
     .reply h2 {{ font-size: 1.15rem; }}
@@ -789,6 +1057,23 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
     .annotated-card {{ border: 1px solid #e2e8f0; border-radius: 12px; padding: 10px; background: #fff; }}
     .annotated-head {{ display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; align-items: baseline; }}
     .annotated-preview {{ width: 100%; height: auto; display: block; border-radius: 8px; border: 1px solid #e2e8f0; }}
+    .exec-row {{ display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; margin-bottom: 8px; }}
+    .exec-row .dashboard, .exec-row .exec-card {{ flex: 1 1 280px; min-width: 0; }}
+    .pie-wrap {{ display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }}
+    .pie-legend {{ list-style: none; margin: 0; padding: 0; font-size: 0.88rem; }}
+    .pie-legend li {{ margin: 6px 0; display: flex; align-items: center; gap: 8px; }}
+    .swatch {{ width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }}
+    .reinspect-banner {{ background: linear-gradient(135deg, #fef2f2 0%, #fff7ed 100%); border: 1px solid #fecaca; border-radius: 14px; padding: 18px 20px; }}
+    .reinspect-title {{ margin: 0 0 8px; font-size: 1.35rem; color: #991b1b; letter-spacing: 0; }}
+    .reinspect-lead {{ margin: 0 0 14px; }}
+    .reinspect-grid {{ display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }}
+    .reinspect-card {{ background: #fff; border: 1px solid #fecaca; border-radius: 10px; padding: 12px 14px; }}
+    .reinspect-top {{ display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; flex-wrap: wrap; }}
+    .doubt-pill {{ font-size: 0.72rem; font-weight: 700; background: #fee2e2; color: #b91c1c; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }}
+    .reinspect-reason {{ margin: 8px 0 0; font-size: 0.88rem; color: #334155; }}
+    .compliance-card {{ background: #f8fafc; border-radius: 12px; padding: 16px 18px; border: 1px solid #e2e8f0; }}
+    .compliance-status {{ margin: 0 0 10px; }}
+    .cite-list {{ margin: 0; padding-left: 1.1rem; }}
   </style>
 </head>
 <body>
@@ -803,10 +1088,11 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
         <span><strong>Generated</strong> {escape(generated_at)}</span>
       </div>
     </header>
-    {chart_html}
-    {sections_html}
+    {manual_html}
+    {comp_html}
+    {featured_row}
 {tail_sections}
-    <p class="footnote">CIA Construction Insight Agent — exported document. Tables and charts are illustrative where sample data is used.</p>
+    <p class="footnote">CIA Construction Insight Agent — exported document. References are restricted to project documents only (Drawings, Project Files, Selected Ordinance Docs).</p>
   </div>
 </body>
 </html>
@@ -827,345 +1113,45 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
         ann_path.write_bytes(image_bytes)
         annotated_downloads[f"annotated_png_{i}"] = f"/api/ai/reports/download/{ann_name}"
 
-    with csv_path.open("w", encoding="utf-8", newline="") as fp:
-        writer = csv.writer(fp)
-        writer.writerow(["type", "key", "value"])
-        writer.writerow(["meta", "report_id", report_id])
-        writer.writerow(["meta", "report_title", report_title])
-        writer.writerow(["meta", "author", author])
-        writer.writerow(["meta", "generated_at", generated_at])
-        writer.writerow(["meta", "project_id", payload.get("project_id")])
-        writer.writerow(["meta", "project_name", project_name])
-        writer.writerow(["meta", "annotated_drawing_count", len(annotated_assets)])
-        for key, value in section_rows:
-            writer.writerow(["section", key, value])
-        for i, asset in enumerate(annotated_assets, start=1):
-            writer.writerow(
-                [
-                    "annotated_drawing",
-                    str(i),
-                    json.dumps(
-                        {
-                            "filename": str(asset.get("filename", "")),
-                            "marker_count": len(asset.get("markers") or []),
-                            "download_key": f"annotated_png_{i}",
-                        },
-                        ensure_ascii=False,
-                    ),
-                ]
-            )
-        writer.writerow(["chat", "full_chat_text", full_chat_text])
-        writer.writerow(["chat", "rendered_html_file", html_path.name])
-
-    from openpyxl import Workbook
-    from openpyxl.styles import Font
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Cover"
-    ws.append(["Report title", report_title])
-    ws.append(["Author", author])
-    ws.append(["Generated", generated_at])
-    ws.append(["Project", project_name])
-    ws.append(["Report ID", report_id])
-    ws["A1"].font = Font(bold=True)
-    ws2 = wb.create_sheet("Summary")
-    ws2.append(["Section", "Summary"])
-    for key, value in section_rows:
-        ws2.append([key, value])
-    ws2.column_dimensions["A"].width = 32
-    ws2.column_dimensions["B"].width = 110
-    ws3 = wb.create_sheet("Annotations")
-    ws3.append(["Drawing sheet", "Type", "Description", "Severity"])
-    for row in payload.get("deficiency_annotation_samples") or []:
-        ws3.append(
-            [
-                str(row.get("drawing_sheet", "")),
-                str(row.get("annotation_type", "")),
-                str(row.get("description", "")),
-                str(row.get("severity", "")),
-            ]
-        )
-    ws4 = wb.create_sheet("Transcript")
-    ws4.append(["Role", "Timestamp", "Message (Markdown/Text)", "Message (HTML)"])
-    for row in chat_rows:
-        role = str(row.get("role", "assistant"))
-        text = str(row.get("text", ""))
-        html_text = (
-            md.markdown(text, extensions=["tables", "fenced_code", "sane_lists"])
-            if role == "assistant"
-            else f"<p>{escape(text).replace(chr(10), '<br/>')}</p>"
-        )
-        ws4.append([role, str(row.get("created_at", "")), text, html_text])
-    ws5 = wb.create_sheet("Attached Drawings")
-    ws5.append(["Filename", "Markers", "Download key"])
-    for i, asset in enumerate(annotated_assets, start=1):
-        ws5.append(
-            [
-                str(asset.get("filename", "")),
-                len(asset.get("markers") or []),
-                f"annotated_png_{i}",
-            ]
-        )
-    wb.save(xlsx_path)
-
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        name="CIATitle",
-        parent=styles["Title"],
-        fontSize=20,
-        spaceAfter=14,
-        textColor=colors.HexColor("#0f172a"),
+    fb_html = (
+        f"<html><head><style>body{{font-family:{REPORT_FONT_STACK};}}</style></head>"
+        f"<body><h1>{escape(report_title)}</h1>"
+        "<p>PDF conversion failed; use the HTML export for the full report.</p></body></html>"
     )
-    meta_style = ParagraphStyle(
-        name="CIAMeta",
-        parent=styles["Normal"],
-        fontSize=10,
-        textColor=colors.HexColor("#475569"),
-        spaceAfter=6,
-    )
-    body_style = ParagraphStyle(
-        name="CIABody",
-        parent=styles["Normal"],
-        fontSize=10,
-        leading=14,
-        spaceAfter=8,
-    )
-    h2_style = ParagraphStyle(
-        name="CIAH2",
-        parent=styles["Heading2"],
-        fontSize=13,
-        spaceBefore=12,
-        spaceAfter=8,
-        textColor=colors.HexColor("#0f172a"),
-    )
-    section_cell_style = ParagraphStyle(
-        name="CIASectionCell",
-        parent=body_style,
-        fontSize=8,
-        leading=10,
-        spaceAfter=0,
-        wordWrap="LTR",
-    )
-
-    doc = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=A4,
-        leftMargin=48,
-        rightMargin=48,
-        topMargin=52,
-        bottomMargin=52,
-    )
-    story: list = []
-    story.append(Paragraph(escape(REPORT_BRAND_HEADER), title_style))
-    story.append(Paragraph(escape(report_title), h2_style))
-    story.append(
-        Paragraph(
-            f"<b>Report ID:</b> {escape(report_id)} &nbsp;|&nbsp; "
-            f"<b>Project:</b> {escape(project_name)} &nbsp;|&nbsp; "
-            f"<b>Author:</b> {escape(author)} &nbsp;|&nbsp; "
-            f"<b>Generated:</b> {escape(generated_at)}",
-            meta_style,
-        )
-    )
-    story.append(Spacer(1, 10))
-    story.append(Paragraph("<b>Dashboard metrics (bar values)</b>", h2_style))
-    chart = payload.get("chart_metrics") or {}
-    bar_rows = [[escape(str(b.get("label", ""))), str(int(b.get("value", 0) or 0))] for b in chart.get("bars") or []]
-    if bar_rows:
-        t = Table([["Metric", "Value"]] + bar_rows, colWidths=[320, 80])
-        t.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d1fae5")),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 9),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-                    ("TOPPADDING", (0, 0), (-1, -1), 6),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ]
-            )
-        )
-        story.append(t)
-        story.append(Spacer(1, 12))
-    story.append(Paragraph("<b>Structured sections</b>", h2_style))
-    if section_rows:
-        # Plain strings in ReportLab Table cells are parsed as mini-markup; `<` / `&` in JSON
-        # can blank a cell. Use Paragraph + XML-escaped text so full content always renders.
-        sec_hdr = [
-            Paragraph("<b>Section</b>", section_cell_style),
-            Paragraph("<b>Summary / detail</b>", section_cell_style),
-        ]
-        sec_body = [
-            [
-                Paragraph(_pdf_table_cell_markup(key), section_cell_style),
-                Paragraph(_pdf_table_cell_markup(val), section_cell_style),
-            ]
-            for key, val in section_rows
-        ]
-        sec_table = Table([sec_hdr] + sec_body, colWidths=[72, 330])
-        sec_table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d1fae5")),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 8),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                    ("TOPPADDING", (0, 0), (-1, -1), 5),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-                ]
-            )
-        )
-        story.append(sec_table)
-    else:
-        story.append(Paragraph("No structured sections included.", body_style))
-    story.append(Spacer(1, 10))
-    story.append(Paragraph("<b>Deficiency &amp; discrepancy log</b>", h2_style))
-    ann = payload.get("deficiency_annotation_samples") or []
-    if ann:
-        ann_data = [["Sheet", "Type", "Description", "Severity"]]
-        for row in ann:
-            ann_data.append(
-                [
-                    escape(str(row.get("drawing_sheet", ""))),
-                    escape(str(row.get("annotation_type", ""))),
-                    escape(str(row.get("description", "")))[:800],
-                    escape(str(row.get("severity", ""))),
-                ]
-            )
-        at = Table(ann_data, colWidths=[70, 80, 300, 55])
-        at.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#ecfdf5")),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 8),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ]
-            )
-        )
-        story.append(at)
-    else:
-        story.append(Paragraph("No annotation samples in this export.", body_style))
-    story.append(Spacer(1, 14))
-    story.append(Paragraph("<b>Transcript</b>", h2_style))
-    for row in chat_rows:
-        role = str(row.get("role", "assistant"))
-        created = str(row.get("created_at", ""))
-        text = str(row.get("text", ""))
-        label = "AI Assistant" if role == "assistant" else "You"
-        story.append(Paragraph(f"<b>{escape(label)}</b> · {escape(created)}", body_style))
-        safe = escape(text).replace("\n", "<br/>")
-        story.append(Paragraph(safe, body_style))
-        story.append(Spacer(1, 6))
-    doc.build(story)
+    try:
+        pdf_path.write_bytes(_html_to_pdf_bytes_for_report(report_html))
+    except Exception:
+        pdf_path.write_bytes(_html_to_pdf_bytes_xhtml2pdf(fb_html))
 
     from docx import Document
     from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
     from docx.shared import Pt
+    from htmldocx import HtmlToDocx
 
-    docx_doc = Document()
-    t_para = docx_doc.add_paragraph()
-    t_run = t_para.add_run(REPORT_BRAND_HEADER)
-    t_run.bold = True
-    t_run.font.size = Pt(22)
-    t_para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
-    sub_para = docx_doc.add_paragraph()
-    sub_run = sub_para.add_run(report_title)
-    sub_run.bold = True
-    sub_run.font.size = Pt(14)
-
-    meta = docx_doc.add_paragraph()
-    meta.add_run("Report ID: ").bold = True
-    meta.add_run(f"{report_id}\n")
-    meta.add_run("Project: ").bold = True
-    meta.add_run(f"{project_name}\n")
-    meta.add_run("Author: ").bold = True
-    meta.add_run(f"{author}\n")
-    meta.add_run("Generated: ").bold = True
-    meta.add_run(generated_at)
-
-    docx_doc.add_heading("Dashboard metrics", level=2)
-    table = docx_doc.add_table(rows=1, cols=2)
-    table.style = "Table Grid"
-    hdr = table.rows[0].cells
-    hdr[0].text = "Metric"
-    hdr[1].text = "Value"
-    for b in (payload.get("chart_metrics") or {}).get("bars") or []:
-        row = table.add_row().cells
-        row[0].text = str(b.get("label", ""))
-        row[1].text = str(int(b.get("value", 0) or 0))
-
-    docx_doc.add_heading("Structured sections", level=2)
-    sec_table = docx_doc.add_table(rows=1, cols=2)
-    sec_table.style = "Table Grid"
-    sec_hdr = sec_table.rows[0].cells
-    sec_hdr[0].text = "Section"
-    sec_hdr[1].text = "Summary"
-    for key, value in section_rows:
-        row = sec_table.add_row().cells
-        row[0].text = key
-        val_str = str(value)
-        if len(val_str) > 45000:
-            val_str = val_str[:45000] + "\n\n[Truncated for Word cell size. Use HTML or JSON export for the full text.]"
-        row[1].text = val_str
-
-    docx_doc.add_heading("Deficiency & discrepancy annotations", level=2)
-    docx_doc.add_paragraph(
-        payload.get("annotated_preview_note")
-        or "Record deficiencies (code / safety) and discrepancies (drawing vs schedule) with sheet references."
-    )
-    for row in payload.get("deficiency_annotation_samples") or []:
-        p = docx_doc.add_paragraph(style="List Bullet")
-        p.add_run(f"{row.get('annotation_type', '')} — {row.get('drawing_sheet', '')}: ").bold = True
-        p.add_run(str(row.get("description", "")))
-
-    attach_heading = str(payload.get("attached_annotations_section_title") or "Attached annotated drawings")
-
-    def _docx_transcript_block() -> None:
-        docx_doc.add_heading("Transcript", level=2)
-        for row in chat_rows:
-            p = docx_doc.add_paragraph()
-            p.add_run(f"[{str(row.get('role', 'assistant')).upper()}] ").bold = True
-            p.add_run(str(row.get("created_at", "")))
-            docx_doc.add_paragraph(str(row.get("text", "")))
-
-    def _docx_attached_list_block() -> None:
-        docx_doc.add_heading(attach_heading, level=2)
-        if annotated_assets:
-            for i, asset in enumerate(annotated_assets, start=1):
-                p = docx_doc.add_paragraph(style="List Bullet")
-                p.add_run(f"{asset.get('filename', f'Drawing {i}')} ").bold = True
-                p.add_run(f"({len(asset.get('markers') or [])} marker(s), download key: annotated_png_{i})")
-        else:
-            docx_doc.add_paragraph("No annotated drawings attached.")
-
-    if attached_annotations_last and annotated_assets:
-        _docx_transcript_block()
-        _docx_attached_list_block()
-    else:
-        _docx_attached_list_block()
-        _docx_transcript_block()
-    docx_doc.save(docx_path)
-
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        document = Document()
+        _apply_report_docx_base_font(document)
+        HtmlToDocx().add_html_to_document(report_html, document)
+        document.save(str(docx_path))
+    except Exception:
+        docx_doc = Document()
+        _apply_report_docx_base_font(docx_doc)
+        t_para = docx_doc.add_paragraph()
+        t_run = t_para.add_run(REPORT_BRAND_HEADER)
+        t_run.bold = True
+        t_run.font.size = Pt(22)
+        t_para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+        sub = docx_doc.add_paragraph()
+        sub_run = sub.add_run(report_title)
+        sub_run.bold = True
+        sub_run.font.size = Pt(14)
+        docx_doc.add_paragraph(
+            "Word export could not convert the full HTML layout automatically. "
+            "Please use the HTML or PDF download for the complete document."
+        )
+        docx_doc.save(docx_path)
 
     return {
-        "json": f"/api/ai/reports/download/{json_path.name}",
-        "csv": f"/api/ai/reports/download/{csv_path.name}",
-        "excel": f"/api/ai/reports/download/{xlsx_path.name}",
         "pdf": f"/api/ai/reports/download/{pdf_path.name}",
         "word": f"/api/ai/reports/download/{docx_path.name}",
         "html": f"/api/ai/reports/download/{html_path.name}",
@@ -1173,15 +1159,107 @@ def _write_report_files(report_id: str, payload: dict) -> dict:
     }
 
 
-@router.post("/reports/standard")
-def generate_standard_report(
+def _build_consolidated_collection_report(
+    project: Project,
+    body: ConsolidateCollectionReportRequest,
+) -> tuple[str, dict, dict[str, str]]:
+    """Assemble Custom Report from collected materials only (no per-item OpenRouter calls)."""
+    report_id = f"consolidated-collection-{body.project_id}-{uuid4().hex[:8]}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    transcript: list[dict] = []
+    for item in body.items:
+        t = (item.text or "").strip()
+        if not t:
+            continue
+        transcript.append(
+            {
+                "role": "user",
+                "text": f"{item.label} ({item.source})",
+                "created_at": item.created_at or now_iso,
+            }
+        )
+        transcript.append({"role": "assistant", "text": t, "created_at": item.created_at or now_iso})
+    if not transcript:
+        for item in body.items:
+            header = f"### {item.label}\n_Source: {item.source}_ · _ID: {item.id or '—'}_\n\n"
+            transcript.append(
+                {
+                    "role": "assistant",
+                    "text": header + (item.text or ""),
+                    "created_at": item.created_at or now_iso,
+                }
+            )
+
+    ann_payload = (
+        [a.model_dump() for a in body.annotation_assets] if body.include_annotated_drawing else []
+    )
+    payload = _report_payload(
+        body.project_id,
+        chat_history=transcript,
+        annotation_assets=ann_payload,
+    )
+    merged_sections = _merged_sections_from_collected_materials(body.items)
+    collected_gs: dict[str, str] = {}
+    for idx, item in enumerate(body.items, start=1):
+        label = (item.label or f"Output {idx}").strip()
+        if len(label) > 76:
+            label = f"{label[:73]}..."
+        collected_gs[f"Collected {idx}: {label}"] = (
+            f"Source: {item.source}\nID: {item.id or '—'}\nCreated: {item.created_at or '—'}\n\n{item.text}"
+        )
+    payload["generated_sections"] = {**merged_sections, **collected_gs, **payload["generated_sections"]}
+    payload["collected_materials"] = [m.model_dump() for m in body.items]
+    if body.include_annotated_drawing and ann_payload:
+        payload["attached_annotations_last"] = True
+        payload["attached_annotations_section_title"] = "Annotated drawing — Custom Report"
+        payload["attached_annotations_section_lead"] = (
+            "Annotated image(s) from Drawings or Project files (final section of this Custom Report)."
+        )
+    _apply_report_metadata(payload, project, "Consolidated Report (Collected Outputs)", body.author)
+    files = _write_report_files(report_id, payload)
+    return report_id, payload, files
+
+
+def _run_custom_report_job_task(job_id: int, body_dict: dict[str, Any], owner_id: int) -> None:
+    db = SessionLocal()
+    job: ReportJob | None = None
+    try:
+        body = ConsolidateCollectionReportRequest(**body_dict)
+        job = db.query(ReportJob).filter(ReportJob.id == job_id, ReportJob.owner_id == owner_id).first()
+        if not job:
+            return
+        job.status = "running"
+        db.commit()
+        project = db.query(Project).filter(Project.id == body.project_id, Project.owner_id == owner_id).first()
+        if not project:
+            job.status = "failed"
+            job.error_message = "Project not found"
+            job.completed_at = datetime.now(timezone.utc)
+            db.commit()
+            return
+        report_id, _payload, files = _build_consolidated_collection_report(project, body)
+        job.status = "completed"
+        job.report_id = report_id
+        job.downloads_json = json.dumps(files)
+        job.completed_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        job = db.query(ReportJob).filter(ReportJob.id == job_id).first()
+        if job:
+            job.status = "failed"
+            job.error_message = (str(e) or "Report job failed")[:4000]
+            job.completed_at = datetime.now(timezone.utc)
+            db.commit()
+    finally:
+        db.close()
+
+
+def _build_standard_report(
+    project: Project,
     body: ConsolidatedReportRequest,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    project = db.query(Project).filter(Project.id == body.project_id, Project.owner_id == user.id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    db: Session,
+) -> tuple[str, dict, dict[str, str]]:
     report_id = f"standard-{body.project_id}-{uuid4().hex[:8]}"
     selected_prompts = [p.strip() for p in body.user_prompts if isinstance(p, str) and p.strip()]
     if not selected_prompts:
@@ -1200,6 +1278,101 @@ def generate_standard_report(
     )
     _apply_report_metadata(payload, project, "Standard AI Assistant Report", body.author)
     files = _write_report_files(report_id, payload)
+    return report_id, payload, files
+
+
+def _run_standard_report_job_task(job_id: int, body_dict: dict[str, Any], owner_id: int) -> None:
+    db = SessionLocal()
+    job: ReportJob | None = None
+    try:
+        body = ConsolidatedReportRequest(**body_dict)
+        job = db.query(ReportJob).filter(ReportJob.id == job_id, ReportJob.owner_id == owner_id).first()
+        if not job:
+            return
+        job.status = "running"
+        db.commit()
+        project = db.query(Project).filter(Project.id == body.project_id, Project.owner_id == owner_id).first()
+        if not project:
+            job.status = "failed"
+            job.error_message = "Project not found"
+            job.completed_at = datetime.now(timezone.utc)
+            db.commit()
+            return
+        report_id, _payload, files = _build_standard_report(project, body, db)
+        job.status = "completed"
+        job.report_id = report_id
+        job.downloads_json = json.dumps(files)
+        job.completed_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        job = db.query(ReportJob).filter(ReportJob.id == job_id).first()
+        if job:
+            job.status = "failed"
+            job.error_message = (str(e) or "Standard report job failed")[:4000]
+            job.completed_at = datetime.now(timezone.utc)
+            db.commit()
+    finally:
+        db.close()
+
+
+@router.post("/reports/standard/jobs", response_model=StandardReportJobAccepted)
+def enqueue_standard_report(
+    body: ConsolidatedReportRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = db.query(Project).filter(Project.id == body.project_id, Project.owner_id == user.id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    job = ReportJob(
+        owner_id=user.id,
+        project_id=body.project_id,
+        kind="standard_report",
+        status="pending",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    background_tasks.add_task(_run_standard_report_job_task, job.id, body.model_dump(), user.id)
+    return StandardReportJobAccepted(job_id=job.id, status="pending")
+
+
+@router.get("/reports/standard/jobs/{job_id}", response_model=StandardReportJobStatusOut)
+def get_standard_report_job_status(
+    job_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = (
+        db.query(ReportJob)
+        .filter(ReportJob.id == job_id, ReportJob.owner_id == user.id, ReportJob.kind == "standard_report")
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Report job not found")
+    downloads = json.loads(job.downloads_json) if job.downloads_json else None
+    return StandardReportJobStatusOut(
+        job_id=job.id,
+        status=job.status,
+        report_type="standard" if job.status == "completed" else None,
+        report_id=job.report_id,
+        downloads=downloads if isinstance(downloads, dict) else None,
+        error_message=job.error_message,
+    )
+
+
+@router.post("/reports/standard")
+def generate_standard_report(
+    body: ConsolidatedReportRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = db.query(Project).filter(Project.id == body.project_id, Project.owner_id == user.id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    report_id, payload, files = _build_standard_report(project, body, db)
     return {"report_type": "standard", "report_id": report_id, "payload": payload, "downloads": files}
 
 
@@ -1224,57 +1397,60 @@ def generate_consolidated_report(
     return {"report_type": "consolidated", "report_id": report_id, "payload": payload, "downloads": files}
 
 
-@router.post("/reports/consolidate-collection")
-def generate_consolidate_collection_report(
+@router.post("/reports/consolidate-collection/jobs", response_model=CustomReportJobAccepted)
+def enqueue_consolidate_collection_report(
     body: ConsolidateCollectionReportRequest,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     project = db.query(Project).filter(Project.id == body.project_id, Project.owner_id == user.id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    report_id = f"consolidated-collection-{body.project_id}-{uuid4().hex[:8]}"
-    selected_prompts = [item.text.strip() for item in body.items if item.text.strip()]
-    generated_transcript = _run_selected_prompts(selected_prompts, project, db)
-    transcript = generated_transcript
-    if not transcript:
-        transcript = []
-        for item in body.items:
-            header = f"### {item.label}\n_Source: {item.source}_ · _ID: {item.id or '—'}_\n\n"
-            transcript.append(
-                {
-                    "role": "assistant",
-                    "text": header + item.text,
-                    "created_at": item.created_at or "",
-                }
-            )
-    ann_payload = (
-        [a.model_dump() for a in body.annotation_assets] if body.include_annotated_drawing else []
+    job = ReportJob(
+        owner_id=user.id,
+        project_id=body.project_id,
+        kind="custom_report",
+        status="pending",
     )
-    payload = _report_payload(
-        body.project_id,
-        chat_history=transcript,
-        annotation_assets=ann_payload,
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    background_tasks.add_task(_run_custom_report_job_task, job.id, body.model_dump(), user.id)
+    return CustomReportJobAccepted(job_id=job.id, status="pending")
+
+
+@router.get("/reports/consolidate-collection/jobs/{job_id}", response_model=CustomReportJobStatusOut)
+def get_consolidate_collection_job_status(
+    job_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = db.query(ReportJob).filter(ReportJob.id == job_id, ReportJob.owner_id == user.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Report job not found")
+    downloads = json.loads(job.downloads_json) if job.downloads_json else None
+    return CustomReportJobStatusOut(
+        job_id=job.id,
+        status=job.status,
+        report_type="consolidated_collection" if job.status == "completed" else None,
+        report_id=job.report_id,
+        downloads=downloads if isinstance(downloads, dict) else None,
+        error_message=job.error_message,
     )
-    merged_sections = _merged_sections_from_collected_prompts(body.items, generated_transcript or body.chat_history)
-    collected_gs: dict[str, str] = {}
-    for idx, item in enumerate(body.items, start=1):
-        label = (item.label or f"Output {idx}").strip()
-        if len(label) > 76:
-            label = f"{label[:73]}..."
-        collected_gs[f"Collected {idx}: {label}"] = (
-            f"Source: {item.source}\nID: {item.id or '—'}\nCreated: {item.created_at or '—'}\n\n{item.text}"
-        )
-    payload["generated_sections"] = {**merged_sections, **collected_gs, **payload["generated_sections"]}
-    payload["collected_materials"] = [m.model_dump() for m in body.items]
-    if body.include_annotated_drawing and ann_payload:
-        payload["attached_annotations_last"] = True
-        payload["attached_annotations_section_title"] = "Annotated drawing — Custom Report"
-        payload["attached_annotations_section_lead"] = (
-            "Annotated image(s) from Drawings or Project files (final section of this Custom Report)."
-        )
-    _apply_report_metadata(payload, project, "Consolidated Report (Collected Outputs)", body.author)
-    files = _write_report_files(report_id, payload)
+
+
+@router.post("/reports/consolidate-collection")
+def generate_consolidate_collection_report(
+    body: ConsolidateCollectionReportRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Synchronous Custom Report (same assembly as background job). Prefer /jobs for long runs."""
+    project = db.query(Project).filter(Project.id == body.project_id, Project.owner_id == user.id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    report_id, payload, files = _build_consolidated_collection_report(project, body)
     return {"report_type": "consolidated_collection", "report_id": report_id, "payload": payload, "downloads": files}
 
 

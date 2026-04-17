@@ -157,7 +157,12 @@ async function saveEditFolder(folderId: number) {
 
 async function uploadFiles() {
   const picked = uploadInput.value?.files
-  if (!picked?.length || !uploadFolderId.value) return
+  if (!picked?.length) return
+  if (!uploadFolderId.value) {
+    err.value = 'Choose or create an ordinance folder before uploading files.'
+    if (uploadInput.value) uploadInput.value.value = ''
+    return
+  }
   err.value = ''
   const fd = new FormData()
   for (const file of Array.from(picked)) {
@@ -179,6 +184,10 @@ async function uploadFiles() {
 }
 
 function triggerUpload() {
+  if (!uploadFolderId.value) {
+    err.value = 'Choose or create an ordinance folder before uploading files.'
+    return
+  }
   uploadInput.value?.click()
 }
 
@@ -273,7 +282,7 @@ function closePreview() {
 
     <p v-if="err" class="err">{{ err }}</p>
 
-    <div v-if="me?.role === 'admin' && folders.length" class="card folder-strip">
+    <div v-if="me?.role === 'admin'" class="card folder-strip">
       <div class="folder-strip-head">
         <span class="strip-label">Folders</span>
         <button type="button" class="icon-btn tiny" title="Add folder" @click="openAddFolderModal">
@@ -319,6 +328,7 @@ function closePreview() {
           </template>
         </div>
       </div>
+      <p v-if="!folders.length" class="muted small">No folders yet. Click the folder+ button to create your first folder.</p>
     </div>
 
     <div class="card docs-card">
@@ -345,7 +355,13 @@ function closePreview() {
             <option v-for="f in folders" :key="`up-${f.id}`" :value="f.id">{{ f.code }} · {{ f.name }}</option>
           </select>
           <input ref="uploadInput" type="file" class="hidden-file" multiple @change="uploadFiles" />
-          <button type="button" class="icon-btn head-icon" title="Add document(s)" @click="triggerUpload">
+          <button
+            type="button"
+            class="icon-btn head-icon"
+            :disabled="!uploadFolderId"
+            :title="uploadFolderId ? 'Add document(s)' : 'Create/select a folder first'"
+            @click="triggerUpload"
+          >
             <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
               <polyline points="14 2 14 8 20 8" />

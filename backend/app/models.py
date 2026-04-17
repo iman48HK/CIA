@@ -229,3 +229,20 @@ class ProjectOrdinanceSelection(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     project: Mapped["Project"] = relationship(back_populates="selected_ordinance_files")
+
+
+class ReportJob(Base):
+    """Server-side Custom Report generation; survives client disconnect."""
+
+    __tablename__ = "report_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(40), nullable=False, default="custom_report")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending")
+    report_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    downloads_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

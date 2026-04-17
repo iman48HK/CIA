@@ -1,4 +1,5 @@
 backend/.env
+backend/*.db
 .env.deploy
 backend/storage/
 backend/__pycache__/

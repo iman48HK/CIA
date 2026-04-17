@@ -1,6 +1,7 @@
 <script setup lang="ts">
 definePageMeta({ middleware: 'auth' })
 import { marked } from 'marked'
+import mermaid from 'mermaid'
 
 const { apiFetch, base, token } = useApi()
 const { me, loadMe } = useAuth()
@@ -33,6 +34,15 @@ type ReportResult = {
   payload: Record<string, unknown>
   downloads: Record<string, string>
 }
+
+type CustomReportJobStatus = {
+  job_id: number
+  status: string
+  report_type?: string | null
+  report_id?: string | null
+  downloads?: Record<string, string> | null
+  error_message?: string | null
+}
 const reportResult = ref<ReportResult | null>(null)
 const consolidatedReport = ref<ReportResult | null>(null)
 const customReportAnchor = ref<HTMLElement | null>(null)
@@ -41,12 +51,11 @@ const readinessHint = ref('Choose a project before asking.')
 const showPrompts = ref(true)
 
 const DEFAULT_PRESET_PROMPTS = [
-  'Calculate Gross Floor Area (GFA) and Usable Area using geometry.',
-  'Dedicated Space Types Summary with gross_m2, usable_m2, counts, percentages, floor-wise breakdown, efficiency ratio.',
-  'Statistical dashboard (totals, pie charts).',
-  'HK regulations parsing -> structured rules -> compliance checking with citations.',
-  'Missing data detection + doubt_score (0-100) on every extraction + manual_review_reason. Prominent "Manual Re-inspection Required" dashboard.',
-  'LLM-generated suggestions for fixes.',
+  'Space Types Summary with gross, usable, counts, percentages, floor-wise breakdown, efficiency ratio in stated measurement units.',
+  'Based on the project drawings, generate a statistical pie chart of space types and their area.',
+  'Compare against the selected ordinance documents. Regulations parsing -> structured rules -> compliance checking with citations.',
+  'Missing data detection + doubt_score (0-100) on every extraction + manual_review_reason. Prominent "Manual Re-inspection Required" list.',
+  'AI-generated suggestions for fixes.',
 ]
 
 const presetPrompts = ref<string[]>([...DEFAULT_PRESET_PROMPTS])
@@ -54,6 +63,9 @@ const newPresetText = ref('')
 
 type ChatItem = { id: string; role: 'user' | 'assistant'; text: string; created_at: string }
 const chatHistory = ref<ChatItem[]>([])
+const reloadingTurnId = ref<string | null>(null)
+const chatListEl = ref<HTMLElement | null>(null)
+let mermaidInitialized = false
 
 type ChatTurn = { user: ChatItem; assistant: ChatItem | null }
 
@@ -79,6 +91,8 @@ type CollectedItem = {
   label: string
   text: string
   created_at: string
+  /** Normalized user prompt; used to block duplicates */
+  prompt_key?: string
 }
 const collectedOutputs = ref<CollectedItem[]>([])
 const consolidating = ref(false)
@@ -103,14 +117,18 @@ const annotationAssets = ref<AnnotationAsset[]>([])
 const annotationCanvas = ref<HTMLCanvasElement | null>(null)
 const annotationImg = ref<HTMLImageElement | null>(null)
 const openDownloadMenuId = ref('')
+const activeChatJobId = ref<number | null>(null)
 
 function storageKeyChat(projectId: number | null): string | null {
   return projectId ? `cia_chat_history_${projectId}` : null
 }
+function storageKeyChatJob(projectId: number | null): string | null {
+  return projectId ? `cia_chat_job_${projectId}` : null
+}
 
 function storageKeyPresets(): string {
   const uid = me.value?.id ?? 'anon'
-  return `cia_assistant_presets_${uid}`
+  return `cia_assistant_presets_v2_${uid}`
 }
 
 function storageKeyCollected(projectId: number | null): string | null {
@@ -318,6 +336,23 @@ function persistChatHistory(projectId: number | null) {
   localStorage.setItem(key, JSON.stringify(chatHistory.value.slice(-200)))
 }
 
+function persistChatJob(projectId: number | null, jobId: number | null) {
+  if (!import.meta.client) return
+  const key = storageKeyChatJob(projectId)
+  if (!key) return
+  if (!jobId) localStorage.removeItem(key)
+  else localStorage.setItem(key, String(jobId))
+}
+
+function loadChatJob(projectId: number | null): number | null {
+  if (!import.meta.client) return null
+  const key = storageKeyChatJob(projectId)
+  if (!key) return null
+  const raw = localStorage.getItem(key)
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
 onMounted(async () => {
   await loadMe()
   loadPresetPrompts()
@@ -328,7 +363,13 @@ onMounted(async () => {
     loadCollected(selectedProjectId.value)
     loadAnnotationAssets(selectedProjectId.value)
     await refreshReadiness()
+    const pending = loadChatJob(selectedProjectId.value)
+    if (pending) {
+      activeChatJobId.value = pending
+      await pollChatJob(pending)
+    }
   }
+  await renderRichReplyContent()
 })
 
 watch(selectedProjectId, async (projectId) => {
@@ -336,6 +377,14 @@ watch(selectedProjectId, async (projectId) => {
   loadCollected(projectId)
   loadAnnotationAssets(projectId)
   await refreshReadiness()
+  const pending = loadChatJob(projectId)
+  if (pending) {
+    activeChatJobId.value = pending
+    await pollChatJob(pending)
+  } else {
+    activeChatJobId.value = null
+  }
+  await renderRichReplyContent()
 })
 
 watch(me, () => loadPresetPrompts(), { deep: true })
@@ -348,6 +397,39 @@ watch(
   { deep: true }
 )
 
+watch(
+  chatHistory,
+  async () => {
+    await renderRichReplyContent()
+  },
+  { deep: true }
+)
+
+function initMermaidOnce() {
+  if (mermaidInitialized || !import.meta.client) return
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: 'loose',
+    theme: 'default',
+  })
+  mermaidInitialized = true
+}
+
+async function renderRichReplyContent() {
+  if (!import.meta.client) return
+  await nextTick()
+  const root = chatListEl.value
+  if (!root) return
+  initMermaidOnce()
+  const nodes = Array.from(root.querySelectorAll('.turn-content.reply .mermaid')) as HTMLElement[]
+  if (!nodes.length) return
+  try {
+    await mermaid.run({ nodes })
+  } catch {
+    // Keep markdown visible even if diagram rendering fails.
+  }
+}
+
 const reportAuthor = computed(() => {
   const m = me.value
   if (!m) return undefined
@@ -359,7 +441,6 @@ function fullDownloadUrl(path: string): string {
 }
 
 function extensionForReportKey(key: string): string {
-  if (key === 'excel') return 'xlsx'
   if (key === 'word') return 'docx'
   return key
 }
@@ -393,7 +474,7 @@ function chatTurnDownloadOptions(turn: ChatTurn): DownloadOption[] {
 }
 
 function reportDownloadOptions(report: ReportResult): DownloadOption[] {
-  const preferred = ['html', 'pdf', 'word', 'excel', 'csv', 'json']
+  const preferred = ['html', 'pdf', 'word']
   const options: DownloadOption[] = []
   for (const key of preferred) {
     const path = report.downloads[key]
@@ -516,13 +597,31 @@ function downloadTurnExport(turn: ChatTurn, format: 'txt' | 'md' | 'html') {
   downloadTextFile(`cia-turn-${turn.user.id}.html`, html, 'text/html;charset=utf-8')
 }
 
+function collectedMarkdownFromTurn(turn: ChatTurn): string {
+  const head = `## Your message\n\n${turn.user.text}`
+  if (turn.assistant?.text?.trim()) {
+    return `${head}\n\n---\n\n## AI-generated content\n\n${turn.assistant.text}`
+  }
+  return `${head}\n\n---\n\n## AI-generated content\n\n_(No assistant reply yet.)_`
+}
+
 function collectChatTurn(turn: ChatTurn) {
+  const promptKey = turn.user.text.trim()
+  if (!promptKey) return
+  const dup = collectedOutputs.value.some((c) => (c.prompt_key || '').trim() === promptKey)
+  if (dup) {
+    window.alert(
+      'This prompt is already in the Custom Report list. Remove the existing block first if you want to replace it.',
+    )
+    return
+  }
   collectedOutputs.value.push({
     id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-    source: 'Prompt',
-    label: 'Prompt',
-    text: turn.user.text,
+    source: 'Chat',
+    label: 'Chat exchange',
+    text: collectedMarkdownFromTurn(turn),
     created_at: turn.user.created_at,
+    prompt_key: promptKey,
   })
   persistCollected(selectedProjectId.value)
 }
@@ -569,19 +668,14 @@ async function send() {
   chatHistory.value.push(userItem)
   persistChatHistory(selectedProjectId.value)
   try {
-    const res = await apiFetch<{ reply: string }>('/ai/chat', {
+    const job = await apiFetch<{ job_id: number; status: string }>('/ai/chat/jobs', {
       method: 'POST',
       body: JSON.stringify({ message: text, project_id: selectedProjectId.value }),
     })
-    chatHistory.value.push(
-      ensureChatId({
-        role: 'assistant',
-        text: res.reply || '(no content)',
-        created_at: new Date().toISOString(),
-      })
-    )
-    persistChatHistory(selectedProjectId.value)
+    activeChatJobId.value = job.job_id
+    persistChatJob(selectedProjectId.value, job.job_id)
     message.value = ''
+    await pollChatJob(job.job_id)
   } catch (e: unknown) {
     const msg =
       e && typeof e === 'object' && 'data' in e
@@ -590,9 +684,42 @@ async function send() {
     error.value = msg || 'Request failed'
     chatHistory.value.pop()
     persistChatHistory(selectedProjectId.value)
+    persistChatJob(selectedProjectId.value, null)
   } finally {
     loading.value = false
   }
+}
+
+async function pollChatJob(jobId: number) {
+  const projectId = selectedProjectId.value
+  if (!projectId) return
+  const deadline = Date.now() + 300_000
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1500))
+    const st = await apiFetch<{ status: string; reply?: string | null; error_message?: string | null }>(
+      `/ai/chat/jobs/${jobId}`
+    )
+    if (st.status === 'completed') {
+      chatHistory.value.push(
+        ensureChatId({
+          role: 'assistant',
+          text: st.reply || '(no content)',
+          created_at: new Date().toISOString(),
+        })
+      )
+      persistChatHistory(projectId)
+      activeChatJobId.value = null
+      persistChatJob(projectId, null)
+      return
+    }
+    if (st.status === 'failed') {
+      error.value = st.error_message || 'AI reply job failed'
+      activeChatJobId.value = null
+      persistChatJob(projectId, null)
+      return
+    }
+  }
+  error.value = 'AI reply is still processing in background. Come back later to continue.'
 }
 
 function useSuggestion(s: string) {
@@ -605,62 +732,117 @@ function deleteChatTurn(turn: ChatTurn) {
   persistChatHistory(selectedProjectId.value)
 }
 
+async function reloadTurnAssistant(turn: ChatTurn) {
+  if (!selectedProjectId.value || !projectReady.value || reloadingTurnId.value) return
+  const prompt = turn.user.text.trim()
+  if (!prompt) return
+  error.value = ''
+  reloadingTurnId.value = turn.user.id
+  try {
+    const res = await apiFetch<{ reply: string }>('/ai/chat', {
+      method: 'POST',
+      body: JSON.stringify({ message: prompt, project_id: selectedProjectId.value }),
+    })
+    const now = new Date().toISOString()
+    const newAssistant = ensureChatId({
+      role: 'assistant',
+      text: res.reply || '(no content)',
+      created_at: now,
+    })
+    const userIdx = chatHistory.value.findIndex((m) => m.id === turn.user.id)
+    if (userIdx < 0) return
+    const oldAssistantId = turn.assistant?.id
+    if (oldAssistantId) {
+      const oldIdx = chatHistory.value.findIndex((m) => m.id === oldAssistantId)
+      if (oldIdx >= 0) {
+        chatHistory.value.splice(oldIdx, 1)
+      }
+    }
+    const insertAt = Math.min(userIdx + 1, chatHistory.value.length)
+    chatHistory.value.splice(insertAt, 0, newAssistant)
+    persistChatHistory(selectedProjectId.value)
+  } catch (e: unknown) {
+    const msg =
+      e && typeof e === 'object' && 'data' in e
+        ? String((e as { data?: { detail?: string } }).data?.detail)
+        : 'Reload failed'
+    error.value = msg || 'Reload failed'
+  } finally {
+    reloadingTurnId.value = null
+  }
+}
+
 function clearChatHistory() {
   if (!confirm('Remove all messages in this project’s chat?')) return
   chatHistory.value = []
   persistChatHistory(selectedProjectId.value)
 }
 
-async function generateStandardReport() {
-  if (!selectedProjectId.value) return
-  const assets = annotationAssetsForReport()
-  annotationAssets.value = assets
-  reportResult.value = await apiFetch<ReportResult>('/ai/reports/standard', {
-    method: 'POST',
-    body: JSON.stringify({
-      project_id: selectedProjectId.value,
-      user_prompts: DEFAULT_PRESET_PROMPTS,
-      chat_history: chatHistory.value,
-      annotation_assets: assets,
-      author: reportAuthor.value,
-    }),
-  })
-  consolidatedReport.value = null
-}
-
 async function consolidateCollectedReport() {
-  if (!selectedProjectId.value || !collectedOutputs.value.length) return
+  if (!selectedProjectId.value || !collectedOutputs.value.length || consolidating.value) return
   const assets = annotationAssetsForReport()
   annotationAssets.value = assets
   consolidating.value = true
   error.value = ''
   consolidatedReport.value = null
+  const body = {
+    project_id: selectedProjectId.value,
+    author: reportAuthor.value,
+    chat_history: chatHistory.value,
+    include_annotated_drawing: includeDrawingInCustomReport.value,
+    annotation_assets: includeDrawingInCustomReport.value ? assets : [],
+    items: collectedOutputs.value.map((c) => ({
+      id: c.id,
+      source: c.source,
+      label: c.label,
+      text: c.text,
+      created_at: c.created_at,
+    })),
+  }
   try {
-    consolidatedReport.value = await apiFetch<ReportResult>('/ai/reports/consolidate-collection', {
-      method: 'POST',
-      body: JSON.stringify({
-        project_id: selectedProjectId.value,
-        author: reportAuthor.value,
-        chat_history: chatHistory.value,
-        include_annotated_drawing: includeDrawingInCustomReport.value,
-        annotation_assets: includeDrawingInCustomReport.value ? assets : [],
-        items: collectedOutputs.value.map((c) => ({
-          id: c.id,
-          source: c.source,
-          label: c.label,
-          text: c.text,
-          created_at: c.created_at,
-        })),
-      }),
-    })
+    const { job_id } = await apiFetch<{ job_id: number; status: string }>(
+      '/ai/reports/consolidate-collection/jobs',
+      {
+        method: 'POST',
+        body: JSON.stringify(body),
+      },
+    )
+    const deadline = Date.now() + 300_000
+    let lastStatus = 'pending'
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500))
+      const st = await apiFetch<CustomReportJobStatus>(`/ai/reports/consolidate-collection/jobs/${job_id}`)
+      lastStatus = st.status
+      if (st.status === 'completed' && st.report_id && st.downloads) {
+        consolidatedReport.value = {
+          report_type: st.report_type || 'consolidated_collection',
+          report_id: st.report_id,
+          payload: {},
+          downloads: st.downloads,
+        }
+        break
+      }
+      if (st.status === 'failed') {
+        error.value = st.error_message || 'Custom Report job failed'
+        break
+      }
+    }
+    if (!consolidatedReport.value && !error.value) {
+      error.value =
+        lastStatus === 'pending' || lastStatus === 'running'
+          ? 'Custom Report is still processing. Refresh this page in a moment and check your downloads folder after starting again, or wait longer on a slow model run.'
+          : 'Custom Report did not complete in time.'
+    }
     await nextTick()
-    customReportAnchor.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    if (consolidatedReport.value) {
+      customReportAnchor.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }
   } catch (e: unknown) {
     const msg =
       e && typeof e === 'object' && 'data' in e
         ? String((e as { data?: { detail?: string } }).data?.detail)
-        : 'Consolidate failed'
-    error.value = msg || 'Consolidate failed'
+        : 'Custom Report failed to start'
+    error.value = msg || 'Custom Report failed to start'
   } finally {
     consolidating.value = false
   }
@@ -693,22 +875,29 @@ function isImageDrawing(row: UploadRow): boolean {
   return (row.content_type || '').startsWith('image/')
 }
 
-function annotationContentPath(projectId: number, fileId: number, kind: AnnotatableKind): string {
+function isAnnotatableUpload(row: UploadRow): boolean {
+  if (isImageDrawing(row)) return true
+  const ct = (row.content_type || '').toLowerCase()
+  const fn = (row.filename || '').toLowerCase()
+  return ct === 'application/pdf' || fn.endsWith('.pdf')
+}
+
+function annotationPreviewPath(projectId: number, fileId: number, kind: AnnotatableKind): string {
   if (kind === 'drawing') {
-    return `/projects/by-id/${projectId}/drawings/${fileId}/content`
+    return `/projects/by-id/${projectId}/drawings/${fileId}/annotation-preview`
   }
-  return `/projects/by-id/${projectId}/project-files/${fileId}/content`
+  return `/projects/by-id/${projectId}/project-files/${fileId}/annotation-preview`
 }
 
 async function openAnnotation(d: UploadRow, kind: AnnotatableKind) {
-  if (!selectedProjectId.value || !isImageDrawing(d)) return
+  if (!selectedProjectId.value || !isAnnotatableUpload(d)) return
   annotationSourceKind.value = kind
   annotationDrawing.value = d
   const saved = annotationAssets.value.find(
     (a) => a.drawing_id === d.id && (a.source_kind ?? 'drawing') === kind
   )
   annotationMarkers.value = saved ? saved.markers.map((m) => ({ ...m })) : []
-  const path = annotationContentPath(selectedProjectId.value, d.id, kind)
+  const path = annotationPreviewPath(selectedProjectId.value, d.id, kind)
   const res = await fetch(`${base()}${path}`, {
     headers: token.value ? { Authorization: `Bearer ${token.value}` } : {},
   })
@@ -936,7 +1125,7 @@ function exportAnnotatedImage() {
                   <span class="fname">{{ f.filename }}</span>
                   <span class="fmeta">{{ formatBytes(f.size_bytes) }}</span>
                   <button
-                    v-if="isImageDrawing(f)"
+                    v-if="isAnnotatableUpload(f)"
                     type="button"
                     class="btn-annotate-launch"
                     @click="openAnnotation(f, 'drawing')"
@@ -963,7 +1152,7 @@ function exportAnnotatedImage() {
                   <span class="fname">{{ f.filename }}</span>
                   <span class="fmeta">{{ formatBytes(f.size_bytes) }}</span>
                   <button
-                    v-if="isImageDrawing(f)"
+                    v-if="isAnnotatableUpload(f)"
                     type="button"
                     class="btn-annotate-launch"
                     @click="openAnnotation(f, 'project_file')"
@@ -1009,9 +1198,6 @@ function exportAnnotatedImage() {
           <div v-if="showPrompts" class="preset-panel">
             <p class="muted small">Manage your saved prompts — add your own or remove ones you do not need.</p>
             <div class="preset-actions">
-              <button type="button" class="btn btn-primary tiny-btn" :disabled="!selectedProjectId" @click="generateStandardReport">
-                Generate Quick Report
-              </button>
               <button type="button" class="btn btn-ghost tiny-btn" :disabled="!selectedProjectId" @click="clearChatHistory">
                 Clear all chat
               </button>
@@ -1073,7 +1259,7 @@ function exportAnnotatedImage() {
           </div>
         </section>
         <div v-if="chatHistory.length || loading" class="output">
-          <div class="chat-list">
+          <div ref="chatListEl" class="chat-list">
             <article
               v-for="(turn, idx) in chatTurns"
               :key="`${turn.user.id}-${idx}`"
@@ -1139,9 +1325,27 @@ function exportAnnotatedImage() {
                   <div class="turn-content" v-html="renderChatHtml(turn.user)" />
                 </div>
                 <div class="turn-section">
-                  <div class="turn-label">AI Assistant</div>
+                  <div class="turn-label turn-label-actions">
+                    <span>AI Assistant</span>
+                    <button
+                      type="button"
+                      class="icon-btn tiny reload-turn-btn"
+                      :disabled="reloadingTurnId === turn.user.id || !projectReady"
+                      title="Ask AI again for this prompt"
+                      @click="reloadTurnAssistant(turn)"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="23 4 23 10 17 10" />
+                        <polyline points="1 20 1 14 7 14" />
+                        <path d="M3.51 9a9 9 0 0 1 14.13-3.36L23 10M1 14l5.36 4.36A9 9 0 0 0 20.49 15" />
+                      </svg>
+                    </button>
+                  </div>
                   <div v-if="turn.assistant" class="turn-content reply" v-html="renderChatHtml(turn.assistant)" />
-                  <div v-else-if="loading && idx === chatTurns.length - 1" class="muted small think-hint">Thinking…</div>
+                  <div v-else-if="loading && idx === chatTurns.length - 1" class="muted small think-hint">
+                    {{ activeChatJobId ? 'Processing in background…' : 'Thinking…' }}
+                  </div>
+                  <div v-else-if="reloadingTurnId === turn.user.id" class="muted small think-hint">Refreshing response…</div>
                   <div v-else class="muted small">No reply recorded.</div>
                 </div>
               </div>
@@ -1180,8 +1384,8 @@ function exportAnnotatedImage() {
       <aside class="panel card side-panel">
         <h2 class="section-label">Custom Report</h2>
         <p class="muted small">
-          Use the list icon on a message to add prompt material here, then build one merged Custom Report with exports
-          (PDF, Word, HTML, etc.).
+          Use the list icon on a message to add the prompt and AI-generated content here. Custom Report runs on the
+          server (you can leave the page); exports are HTML, PDF, and Word from the same layout.
         </p>
         <div ref="customReportAnchor" class="custom-report-actions">
           <button
@@ -1231,7 +1435,7 @@ function exportAnnotatedImage() {
           </label>
           <p class="muted tiny include-drawing-hint">
             When checked, annotated images from Drawings or Project files are added as the <strong>final section</strong> of the
-            Custom Report (HTML and related exports).
+            Custom Report (same HTML layout drives PDF and Word).
           </p>
         </div>
         <ul class="collected-list">
@@ -1620,6 +1824,18 @@ function exportAnnotatedImage() {
   margin-bottom: 0.35rem;
 }
 
+.turn-label-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+}
+
+.reload-turn-btn {
+  width: 24px;
+  height: 24px;
+}
+
 .turn-content {
   font-size: 0.9rem;
   line-height: 1.5;
@@ -1754,6 +1970,8 @@ function exportAnnotatedImage() {
   width: 100%;
   border-collapse: collapse;
   margin: 0.5rem 0 0.75rem;
+  display: block;
+  overflow-x: auto;
 }
 
 .reply :deep(th),
@@ -1766,6 +1984,27 @@ function exportAnnotatedImage() {
 
 .reply :deep(th) {
   background: var(--accent-dim);
+}
+
+.reply :deep(pre) {
+  overflow-x: auto;
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  background: #f8fafc;
+}
+
+.reply :deep(img),
+.reply :deep(svg),
+.reply :deep(canvas),
+.reply :deep(iframe) {
+  max-width: 100%;
+  border-radius: 0.45rem;
+}
+
+.reply :deep(.mermaid) {
+  overflow-x: auto;
+  padding: 0.35rem 0;
 }
 
 .err {

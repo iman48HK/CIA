@@ -11,6 +11,8 @@ python-multipart==0.0.17
 httpx==0.28.1
 email-validator==2.2.0
 markdown
-openpyxl
-reportlab
 python-docx
+pymupdf
+xhtml2pdf
+playwright>=1.49.0
+htmldocx
