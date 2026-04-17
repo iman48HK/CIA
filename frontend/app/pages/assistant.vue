@@ -1151,14 +1151,6 @@ function exportAnnotatedImage() {
                 <li v-for="f in analysisFiles.project_files" :key="'p-' + f.id" class="file-row">
                   <span class="fname">{{ f.filename }}</span>
                   <span class="fmeta">{{ formatBytes(f.size_bytes) }}</span>
-                  <button
-                    v-if="isAnnotatableUpload(f)"
-                    type="button"
-                    class="btn-annotate-launch"
-                    @click="openAnnotation(f, 'project_file')"
-                  >
-                    Annotate
-                  </button>
                 </li>
                 <li v-if="!analysisFiles.project_files.length" class="muted">None</li>
               </ul>
